@@ -1,0 +1,25 @@
+# Local sensitive user data and encryption material
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+plan.json
+plan.dpapi
+private_plan*
+user_profiles.*
+# Generated IDE/build products
+.gradle/
+**/build/
+**/.idea/
+*.iml
+*.class
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+# Developer Windows binary: do not distribute an unsigned build from GitHub
+/desktop/windows/*.exe

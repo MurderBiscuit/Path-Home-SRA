@@ -1,0 +1,37 @@
+name: Defect report (no personal data)
+description: Report a reproducible app problem without identifying a returning individual
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 'Do not include names, case numbers, release dates, precise locations, contact details, screenshots of private profiles, or any other personal information.'
+  - type: input
+    id: platform
+    attributes:
+      label: Platform / OS version
+      placeholder: 'Android 15 or Windows 11 (do not identify the device owner)'
+    validations:
+      required: true
+  - type: textarea
+    id: journey
+    attributes:
+      label: What journey failed?
+      description: 'Describe generic steps using fictional/sample data.'
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: rootcause
+    attributes:
+      label: Suspected cause, workarounds or related regressions (optional)

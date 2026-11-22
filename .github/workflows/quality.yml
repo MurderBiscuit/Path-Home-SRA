@@ -1,0 +1,62 @@
+name: Path Home quality gates
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  source-and-windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: desktop/windows/go.mod
+      - name: Go unit and vet tests
+        working-directory: desktop/windows
+        run: |
+          go test ./...
+          GOOS=windows GOARCH=amd64 go vet ./...
+      - name: Windows x64 cross-compile (unsigned QA build)
+        working-directory: desktop/windows
+        run: GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-H windowsgui' -o PathHome_Windows_x64.exe .
+      - name: Embed approved app icon into unsigned Windows QA build
+        run: python tools/embed_windows_icon.py --exe desktop/windows/PathHome_Windows_x64.exe --ico branding/PathHome.ico
+      - name: Approved branding, legal-source, privacy and source integrity gates
+        run: python qa/verify_release.py
+      - name: Check resulting Windows PE
+        run: |
+          python - <<'PYTEST'
+          import pathlib,struct
+          p=pathlib.Path('desktop/windows/PathHome_Windows_x64.exe').read_bytes()
+          assert p[:2]==b'MZ' and p[struct.unpack_from('<I',p,0x3c)[0]:][:4]==b'PE\0\0' and b'.rsrc\0' in p[:8192]
+          print('Windows PE validated')
+          PYTEST
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android 35 SDK
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Android Java business-rule tests
+        run: |
+          mkdir -p /tmp/pathhome-rules
+          javac -d /tmp/pathhome-rules android/app/src/main/java/org/pathhome/sra/WorkflowRules.java android/qa/WorkflowRulesTest.java
+          java -cp /tmp/pathhome-rules org.pathhome.sra.WorkflowRulesTest
+      - name: Compile native Android debug APK (not for distribution)
+        working-directory: android
+        run: gradle --no-daemon :app:assembleDebug

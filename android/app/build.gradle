@@ -1,0 +1,17 @@
+plugins { id 'com.android.application' }
+
+android {
+    namespace 'org.pathhome.sra'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'org.pathhome.sra'
+        minSdk 26
+        targetSdk 35
+        versionCode 6
+        versionName '0.9.6'
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
