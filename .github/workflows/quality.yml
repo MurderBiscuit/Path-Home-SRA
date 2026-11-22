@@ -49,9 +49,15 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.7'
-      - uses: android-actions/setup-android@v3
       - name: Install Android 35 SDK
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+        run: |
+          # Ubuntu GitHub runners already include Android command-line tools.
+          # Avoid the obsolete 'tools' package requested by older setup actions.
+          test -n "${ANDROID_HOME:-}" || { echo "ANDROID_HOME is unset"; exit 1; }
+          command -v sdkmanager
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
       - name: Android Java business-rule tests
         run: |
           mkdir -p /tmp/pathhome-rules
@@ -60,3 +66,10 @@ jobs:
       - name: Compile native Android debug APK (not for distribution)
         working-directory: android
         run: gradle --no-daemon :app:assembleDebug
+      - name: Save Android debug APK for device testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: path-home-android-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
