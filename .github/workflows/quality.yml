@@ -54,9 +54,11 @@ jobs:
           # Ubuntu GitHub runners already include Android command-line tools.
           # Avoid the obsolete 'tools' package requested by older setup actions.
           test -n "${ANDROID_HOME:-}" || { echo "ANDROID_HOME is unset"; exit 1; }
-          command -v sdkmanager
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          # sdkmanager is installed in a versioned directory, not always on PATH.
+          SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -path '*/bin/sdkmanager' | sort -V | tail -n 1)"
+          test -n "$SDKMANAGER" && test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-35" "build-tools;35.0.0"
           test -f "$ANDROID_HOME/platforms/android-35/android.jar"
       - name: Android Java business-rule tests
         run: |
