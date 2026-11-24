@@ -47,6 +47,13 @@ var (
 	pSetTextColor     = gdi32.NewProc("SetTextColor")
 	pCreateFont       = gdi32.NewProc("CreateFontW")
 	pCreateBrush      = gdi32.NewProc("CreateSolidBrush")
+	pCreatePen        = gdi32.NewProc("CreatePen")
+	pSelectObject     = gdi32.NewProc("SelectObject")
+	pDeleteObject     = gdi32.NewProc("DeleteObject")
+	pRoundRect        = gdi32.NewProc("RoundRect")
+	pDrawText         = user32.NewProc("DrawTextW")
+	pDrawFocusRect    = user32.NewProc("DrawFocusRect")
+	pFillRect         = user32.NewProc("FillRect")
 	pGetModule        = kernel32.NewProc("GetModuleHandleW")
 	pShellExec        = shell32.NewProc("ShellExecuteW")
 )
@@ -79,6 +86,13 @@ const (
 )
 
 type point struct{ X, Y int32 }
+type buttonRect struct{ Left, Top, Right, Bottom int32 }
+type drawItem struct {
+	CtlType, CtlID, ItemID, ItemAction, ItemState uint32
+	HwndItem, DC uintptr
+	Rect buttonRect
+	ItemData uintptr
+}
 type message struct {
 	Hwnd           uintptr
 	Message        uint32
@@ -152,7 +166,7 @@ type database struct {
 
 var (
 	hwnd                       uintptr
-	font, largeFont, titleFont uintptr
+	font, largeFont, titleFont, buttonFont uintptr
 	brush                      uintptr
 	controls                   []uintptr
 	fields                     map[string]uintptr
@@ -190,10 +204,46 @@ func title(x, y, w int, s string) uintptr {
 	return c
 }
 func btn(x, y, w, h int, s string, id int, fn func()) uintptr {
-	c := create("BUTTON", s, WS_CHILD|WS_VISIBLE|WS_TABSTOP, x, y, w, h, hwnd, id)
-	proc(pSendMessage, c, WM_SETFONT, font, 1)
+	c := create("BUTTON", s, WS_CHILD|WS_VISIBLE|WS_TABSTOP|0x000B, x, y, w, h, hwnd, id)
+	proc(pSendMessage, c, WM_SETFONT, buttonFont, 1)
 	clickActions[id] = fn
 	return c
+}
+// Owner-drawn push buttons retain the native BUTTON click and focus behavior.
+func paintButton(d *drawItem) {
+	r := d.Rect
+	proc(pFillRect, d.DC, uintptr(unsafe.Pointer(&r)), brush)
+	label := getText(d.HwndItem)
+	nav := d.CtlID >= 100 && d.CtlID < 111
+	secondary := nav || d.CtlID == 900 || d.CtlID == 901 || (d.CtlID >= 510 && d.CtlID <= 516)
+	active := strings.HasPrefix(label, "• ")
+	fill, edge, ink := uintptr(0x0063700e), uintptr(0x004e5809), uintptr(0x00ffffff)
+	if secondary && !active {
+		fill, edge, ink = 0x00f3f6ed, 0x00bfc9a5, 0x003e2a12
+	}
+	if d.ItemState&1 != 0 {
+		if secondary && !active { fill = 0x00dcebe1 } else { fill = 0x004e5809 }
+	}
+	if d.ItemState&4 != 0 { fill, edge, ink = 0x00e7e7e7, 0x00cccccc, 0x00666666 }
+	b := proc(pCreateBrush, fill)
+	pen := proc(pCreatePen, 0, 1, edge)
+	oldB := proc(pSelectObject, d.DC, b)
+	oldP := proc(pSelectObject, d.DC, pen)
+	proc(pRoundRect, d.DC, uintptr(r.Left+1), uintptr(r.Top+1), uintptr(r.Right-1), uintptr(r.Bottom-1), 14, 14)
+	proc(pSelectObject, d.DC, oldB)
+	proc(pSelectObject, d.DC, oldP)
+	proc(pDeleteObject, b)
+	proc(pDeleteObject, pen)
+	oldF := proc(pSelectObject, d.DC, buttonFont)
+	proc(pSetBkMode, d.DC, 1)
+	proc(pSetTextColor, d.DC, ink)
+	tr := buttonRect{r.Left+10,r.Top+2,r.Right-10,r.Bottom-2}
+	proc(pDrawText, d.DC, uintptr(unsafe.Pointer(ptr(label))), ^uintptr(0), uintptr(unsafe.Pointer(&tr)), 0x0001|0x0004|0x0020|0x0800|0x8000)
+	proc(pSelectObject, d.DC, oldF)
+	if d.ItemState&0x10 != 0 {
+		fr := buttonRect{r.Left+4,r.Top+4,r.Right-4,r.Bottom-4}
+		proc(pDrawFocusRect, d.DC, uintptr(unsafe.Pointer(&fr)))
+	}
 }
 func edit(key string, x, y, w, h int, multiline bool) uintptr {
 	style := uint32(WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP)
@@ -895,6 +945,14 @@ func drawStay(x, w int) {
 }
 func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 	switch msg {
+	case 0x002B: // WM_DRAWITEM
+		if l != 0 {
+			d := (*drawItem)(unsafe.Pointer(l))
+			if d.CtlType == 4 {
+				paintButton(d)
+				return 1
+			}
+		}
 	case WM_COMMAND:
 		id := int(w & 0xffff)
 		if fn, ok := clickActions[id]; ok {
@@ -972,6 +1030,7 @@ func main() {
 	}
 	hwnd = h
 	font = proc(pCreateFont, 21, 0, 0, 0, 480, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
+	buttonFont = proc(pCreateFont, 18, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	largeFont = proc(pCreateFont, 28, 0, 0, 0, 650, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	titleFont = proc(pCreateFont, 33, 0, 0, 0, 730, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	draw()
