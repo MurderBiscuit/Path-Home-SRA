@@ -54,6 +54,7 @@ var (
 	pDrawText         = user32.NewProc("DrawTextW")
 	pDrawFocusRect    = user32.NewProc("DrawFocusRect")
 	pFillRect         = user32.NewProc("FillRect")
+	pCopyMemory       = syscall.NewLazyDLL("ntdll.dll").NewProc("RtlMoveMemory")
 	pGetModule        = kernel32.NewProc("GetModuleHandleW")
 	pShellExec        = shell32.NewProc("ShellExecuteW")
 )
@@ -947,9 +948,12 @@ func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 	switch msg {
 	case 0x002B: // WM_DRAWITEM
 		if l != 0 {
-			d := (*drawItem)(unsafe.Pointer(l))
+			// WM_DRAWITEM supplies a valid DRAWITEMSTRUCT for this synchronous message.
+			// Copy its bytes through Win32 rather than converting an integer to a Go pointer.
+			var d drawItem
+			proc(pCopyMemory, uintptr(unsafe.Pointer(&d)), l, unsafe.Sizeof(d))
 			if d.CtlType == 4 {
-				paintButton(d)
+				paintButton(&d)
 				return 1
 			}
 		}
