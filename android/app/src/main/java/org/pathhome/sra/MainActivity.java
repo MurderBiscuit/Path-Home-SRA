@@ -112,8 +112,40 @@ public class MainActivity extends Activity {
     private TextView paragraph(String s){TextView t=text(s,16,MUTED,false);padding(t,0,5,0,13);return t;}
     private View spacer(int h){View v=new View(this);v.setLayoutParams(new LinearLayout.LayoutParams(1,dp(h)));return v;}
     private LinearLayout card(LinearLayout dest){LinearLayout c=column();c.setBackground(stroke(WHITE,0xffe2e6e3));padding(c,16,16,16,16);c.setElevation(dp(2));LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.setMargins(dp(2),dp(7),dp(2),dp(9));dest.addView(c,p);return c;}
-    private Button button(String s,Runnable action){Button b=new Button(this);b.setAllCaps(false);b.setText(s);b.setTextSize(16);b.setTextColor(WHITE);b.setBackground(bg(TEAL,12));b.setMinimumHeight(dp(52));b.setOnClickListener(v->action.run());return b;}
-    private Button soft(String s,Runnable action){Button b=button(s,action);b.setTextColor(NAVY);b.setBackground(stroke(0xffeaf5f1,0xffc9e1da));return b;}
+    private android.graphics.drawable.Drawable buttonSurface(boolean secondary){
+        int fill=secondary?0xffedf6f3:TEAL;
+        int edge=secondary?0xffa5c9bf:0xff09584e;
+        GradientDrawable surface=bg(fill,14);
+        surface.setStroke(dp(1),edge);
+        return new android.graphics.drawable.RippleDrawable(
+            android.content.res.ColorStateList.valueOf(secondary?0x220e7063:0x33ffffff),
+            surface,bg(Color.WHITE,14));
+    }
+    private Button button(String s,Runnable action){
+        Button b=new Button(this);
+        b.setAllCaps(false);
+        b.setText(s);
+        b.setTextSize(16);
+        b.setTypeface(Typeface.create("sans-serif-medium",Typeface.NORMAL));
+        b.setLetterSpacing(0.01f);
+        b.setTextColor(WHITE);
+        b.setBackgroundTintList(null);
+        b.setBackground(buttonSurface(false));
+        b.setMinHeight(dp(52));
+        b.setMinimumHeight(dp(52));
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(16),dp(12),dp(16),dp(12));
+        b.setElevation(dp(2));
+        b.setOnClickListener(v->action.run());
+        return b;
+    }
+    private Button soft(String s,Runnable action){
+        Button b=button(s,action);
+        b.setTextColor(NAVY);
+        b.setBackground(buttonSurface(true));
+        b.setElevation(0);
+        return b;
+    }
     private void title(LinearLayout dest,String t){add(dest,text(t,25,NAVY,true));dest.addView(spacer(7));}
     private void small(LinearLayout dest,String t){add(dest,text(t,13,MUTED,false));}
     private ImageView photo(String image,int h){ImageView p=new ImageView(this);p.setImageResource(images.get(image));p.setScaleType(ImageView.ScaleType.CENTER_CROP);p.setBackground(bg(0xffd7e7df,14));p.setClipToOutline(true);p.setLayoutParams(new LinearLayout.LayoutParams(-1,dp(h)));return p;}
