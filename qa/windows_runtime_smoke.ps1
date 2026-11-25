@@ -21,6 +21,35 @@ public static class PathHomeSmoke {
     public static extern IntPtr ReadText(IntPtr window, uint msg, UIntPtr w, StringBuilder l, uint flags, uint ms, out UIntPtr result);
     [DllImport("user32.dll")]
     public static extern uint GetGuiResources(IntPtr process, uint flags);
+    public delegate bool EnumProc(IntPtr h, IntPtr p);
+    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
+    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
+    [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X,Y; }
+    public static IntPtr[] Children(IntPtr h) {
+        var list = new System.Collections.Generic.List<IntPtr>();
+        EnumChildWindows(h, delegate(IntPtr c,IntPtr p) { if(GetParent(c)==h && IsWindowVisible(c))list.Add(c); return true; }, IntPtr.Zero);
+        return list.ToArray();
+    }
+    public static string GeometryFailure(IntPtr h) {
+        RECT client; POINT origin=new POINT();
+        if(!GetClientRect(h,out client)||!ClientToScreen(h,ref origin)) return "Unable to inspect client geometry";
+        var children=Children(h); var rects=new RECT[children.Length];
+        for(int i=0;i<children.Length;i++){
+            if(!GetWindowRect(children[i],out rects[i])) return "Unable to inspect child geometry";
+            var r=rects[i];
+            if(r.L<origin.X || r.T<origin.Y || r.R>origin.X+client.R || r.B>origin.Y+client.B) return "Child extends outside client: "+i+" at "+r.L+","+r.T+","+r.R+","+r.B;
+            for(int j=0;j<i;j++){
+                var q=rects[j];
+                if(Math.Min(r.R,q.R)>Math.Max(r.L,q.L) && Math.Min(r.B,q.B)>Math.Max(r.T,q.T)) return "Overlapping child rectangles "+j+" and "+i+" at "+r.L+","+r.T;
+            }
+        }
+        return "";
+    }
 }
 '@
 function Send-Bounded([IntPtr]$Window, [uint32]$Message, [uint32]$W = 0, [IntPtr]$L = [IntPtr]::Zero) {
@@ -33,12 +62,32 @@ function Require-Control([IntPtr]$Window, [int]$Id) {
     if ($control -eq [IntPtr]::Zero) { throw "Expected control $Id was not rendered." }
     return $control
 }
+function Assert-Geometry([IntPtr]$Window) {
+    $problem = [PathHomeSmoke]::GeometryFailure($Window)
+    if ($problem) { throw $problem }
+}
+function Read-Control([IntPtr]$Control) {
+    $buffer = [Text.StringBuilder]::new(8192)
+    $result = [UIntPtr]::Zero
+    if ([PathHomeSmoke]::ReadText($Control, 0xD, [UIntPtr]::new([uint32]8192), $buffer, 3, 5000, [ref]$result) -eq [IntPtr]::Zero) { throw 'Cannot read control text.' }
+    return $buffer.ToString()
+}
+function Set-Field([IntPtr]$Window,[int]$Id,[string]$Value) {
+    $edit = Require-Control $Window $Id
+    $result = [UIntPtr]::Zero
+    if ([PathHomeSmoke]::SendText($edit, 0xC, [UIntPtr]::Zero, $Value, 3, 5000, [ref]$result) -eq [IntPtr]::Zero -or $result.ToUInt64() -eq 0) { throw "Cannot write field $Id." }
+}
+function Assert-Screen([IntPtr]$Window,[string]$Expected) {
+    $screen = ([PathHomeSmoke]::Children($Window) | ForEach-Object { Read-Control $_ }) -join ' '
+    if (-not $screen.Contains($Expected)) { throw "Expected screen text missing: $Expected" }
+}
 function Navigate([IntPtr]$Window, [int]$Button, [int]$Expected) {
     $control = Require-Control $Window $Button
     # Send the exact BN_CLICKED notification used by a native button.
     Send-Bounded $Window 0x111 $Button $control
     Send-Bounded $Window 0
     [void](Require-Control $Window $Expected)
+    Assert-Geometry $Window
 }
 function Set-State([IntPtr]$Window) {
     $edit = Require-Control $Window 1200
@@ -75,11 +124,39 @@ try {
         if ($window -eq [IntPtr]::Zero) { throw "Launch $i did not create its window." }
         Send-Bounded $window 0
         [void](Require-Control $window 200)
+        Assert-Geometry $window
         Navigate $window 101 350
         if ($i -eq 1) { Set-State $window } else { Assert-State $window }
         Navigate $window 100 200
         Navigate $window 101 350
         Assert-State $window
+        # Confirm optional amounts remain unknown instead of silently becoming zero.
+        Navigate $window 105 380
+        if ($i -eq 1) {
+            Set-Field $window 1210 '20'
+            Set-Field $window 1211 ''
+            Set-Field $window 1212 '0'
+            Set-Field $window 1213 '5'
+            Navigate $window 380 380
+        }
+        Assert-Screen $window 'Partial shortfall'
+        if ((Read-Control (Require-Control $window 1211)) -ne '') { throw 'Unknown fee became zero.' }
+        if ((Read-Control (Require-Control $window 1212)) -ne '0.00') { throw 'Explicit zero was not preserved.' }
+        Navigate $window 903 910
+        if ($i -eq 1) {
+            foreach ($theme in 911..917) { Navigate $window $theme 910 }
+            Navigate $window 915 910
+        }
+        Assert-Screen $window 'Current palette: Nebula Orchid'
+        Navigate $window 900 902
+        $mission = Require-Control $window 902
+        $original = Read-Control $mission
+        # EM_LINESCROLL, then return to start; this is a text/scroll responsiveness gate,
+        # not a substitute for pixel-level physical-device visual review.
+        Send-Bounded $mission 0xB6 0 ([IntPtr]10)
+        Send-Bounded $mission 0xB6 0 ([IntPtr](-10))
+        if ((Read-Control $mission) -ne $original) { throw 'Mission content changed while scrolling.' }
+        Navigate $window 100 200
         $baseline = 0
         for ($cycle=1; $cycle -le 3; $cycle++) {
             Navigate $window 102 360
