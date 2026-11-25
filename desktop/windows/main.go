@@ -777,8 +777,8 @@ func drawPlan(x, w int) {
 		r := i / 2
 		xx := x + c*385
 		yy := 224 + r*102
-		text(xx, yy, 360, 27, l.label, false)
-		edit(l.k, xx, yy+29, 348, 38, false)
+		text(xx, yy, 360, 40, l.label, false)
+		edit(l.k, xx, yy+42, 348, 38, false)
 	}
 	btn(x, 655, 280, 55, "Save my dates and plan", 350, func() {
 		if save(false) {
@@ -921,7 +921,7 @@ func drawHelp(x, w int) {
 		}
 		col := i % 4
 		row := i / 4
-		btn(x+col*190, 239+row*48, 181, 43, label, 510+i, func() { input.HelpNeed = c; input.HelpPage = 0; save(true); draw() })
+		btn(x+col*190, 239+row*48, 181, 43, label, 510+i, func() { oldNeed, oldPage := input.HelpNeed, input.HelpPage; input.HelpNeed = c; input.HelpPage = 0; if save(true) { draw() } else { input.HelpNeed, input.HelpPage = oldNeed, oldPage } })
 	}
 	matches := findLocalProviders(data.LocalProviders, stateCode, county, input.HelpNeed)
 	if len(matches) == 0 {
@@ -942,10 +942,10 @@ func drawHelp(x, w int) {
 			btn(x+573, yy, 165, 39, "Official details", 530+i-start, func() { link(r.Website) })
 		}
 		if input.HelpPage > 0 {
-			btn(x, 666, 170, 43, "Previous", 549, func() { input.HelpPage--; draw() })
+			btn(x, 666, 170, 43, "Previous", 549, func() { old := input.HelpPage; input.HelpPage--; if save(true) { draw() } else { input.HelpPage = old } })
 		}
 		if input.HelpPage+1 < pageCount {
-			btn(x+185, 666, 170, 43, "More local help", 550, func() { input.HelpPage++; draw() })
+			btn(x+185, 666, 170, 43, "More local help", 550, func() { old := input.HelpPage; input.HelpPage++; if save(true) { draw() } else { input.HelpPage = old } })
 		}
 	}
 	btn(x+368, 666, 195, 43, "Get unstuck", 551, func() { nav("unstuck") })
@@ -966,7 +966,7 @@ func drawFamily(x, w int) {
 			proc(pSendMessage, c, BM_SETCHECK, 1, 0)
 		}
 		t := t
-		clickActions[id] = func() { input.Checklist[t] = proc(pSendMessage, c, BM_GETCHECK, 0, 0) != 0; save(true) }
+		clickActions[id] = func() { old := input.Checklist[t]; input.Checklist[t] = proc(pSendMessage, c, BM_GETCHECK, 0, 0) != 0; if !save(true) { input.Checklist[t] = old; checked := uintptr(0); if old { checked = 1 }; proc(pSendMessage, c, BM_SETCHECK, checked, 0) } }
 	}
 	btn(x, 650, 270, 53, "Save preparation checklist", 400, func() { save(false) })
 	btn(x+293, 650, 310, 53, "Review release plan dates", 401, func() { nav("plan") })
@@ -991,7 +991,7 @@ func drawProgress(x, w int) {
 			proc(pSendMessage, c, BM_SETCHECK, 1, 0)
 		}
 		t := t
-		clickActions[id] = func() { input.Checklist[t] = proc(pSendMessage, c, BM_GETCHECK, 0, 0) != 0; save(true) }
+		clickActions[id] = func() { old := input.Checklist[t]; input.Checklist[t] = proc(pSendMessage, c, BM_GETCHECK, 0, 0) != 0; if save(true) { draw() } else { input.Checklist[t] = old; checked := uintptr(0); if old { checked = 1 }; proc(pSendMessage, c, BM_SETCHECK, checked, 0) } }
 	}
 	btn(x, 684, 235, 38, "Save my progress", 410, func() { save(false) })
 	btn(x+251, 684, 370, 38, "A step is blocked? Find another way", 411, func() { nav("unstuck") })
@@ -1010,9 +1010,9 @@ func drawUnstuck(x, w int) {
 		row, col := i/2, i%2
 		yy := 374 + row*48
 		btn(x+col*382, yy, 367, 42, label, 800+i, func() {
+			old := input.UnstuckBarrier
 			input.UnstuckBarrier = label
-			save(true)
-			draw()
+			if save(true) { draw() } else { input.UnstuckBarrier = old }
 		})
 	}
 	selected := input.UnstuckBarrier
@@ -1021,7 +1021,7 @@ func drawUnstuck(x, w int) {
 	}
 	text(x, 568, 744, 27, "Selected: "+selected, false)
 	paragraph(x, 601, 740, barrierNextAction(input.UnstuckBarrier), 3)
-	btn(x, 686, 310, 37, "Find the right local help", 815, func() { input.HelpNeed = barrierHelpCategory(input.UnstuckBarrier); input.HelpPage = 0; nav("help") })
+	btn(x, 686, 310, 37, "Find the right local help", 815, func() { oldNeed, oldPage := input.HelpNeed, input.HelpPage; input.HelpNeed = barrierHelpCategory(input.UnstuckBarrier); input.HelpPage = 0; if save(true) { page = "help"; draw() } else { input.HelpNeed, input.HelpPage = oldNeed, oldPage } })
 	btn(x+331, 686, 306, 37, "Review my next steps", 816, func() { nav("progress") })
 }
 
