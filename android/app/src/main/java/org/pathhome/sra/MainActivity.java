@@ -60,18 +60,25 @@ public class MainActivity extends Activity {
     private void queueSave(){if(profileLocked||vaultLocked)return;savePending=true;saveHandler.removeCallbacks(deferredSave);saveHandler.postDelayed(deferredSave,350L);}
     private void flushSave(){if(savePending){saveHandler.removeCallbacks(deferredSave);savePending=false;saveProfile();}}
     @Override protected void onPause(){flushSave();super.onPause();}
-    @Override protected void onStart(){super.onStart();foreground=true;}
+    private final Runnable vaultIdleLock=()->{
+        if(foreground&&vaultKey!=null&&!vaultLocked){lockVault(false);finish();}
+    };
+    private void scheduleVaultIdle(){
+        saveHandler.removeCallbacks(vaultIdleLock);
+        if(foreground&&vaultKey!=null&&!vaultLocked)saveHandler.postDelayed(vaultIdleLock,5*60*1000L);
+    }
+    @Override public void onUserInteraction(){super.onUserInteraction();scheduleVaultIdle();}
+    @Override protected void onStart(){super.onStart();foreground=true;scheduleVaultIdle();}
     @Override protected void onStop(){
-        foreground=false;vaultGeneration++;vaultBusy=false;
-        if(vaultKey!=null&&!vaultLocked){
-            lockVault(false);
-            // End the protected activity on backgrounding to destroy stale dialogs and views.
-            // Rotation creates a fresh locked activity; other returns require reopening Path Home.
-            if(!isChangingConfigurations()&&!isFinishing())finish();
-        }
+        foreground=false;vaultGeneration++;vaultBusy=false;checkInProgress=false;
+        saveHandler.removeCallbacks(vaultIdleLock);
+        if(vaultKey!=null&&!vaultLocked)lockVault(false);
+        // End protected activities, including the password screen, to destroy stale dialogs and views.
+        // Rotation creates a fresh locked activity; other returns require reopening Path Home.
+        if(vaultEnvelope!=null&&!isChangingConfigurations()&&!isFinishing())finish();
         super.onStop();
     }
-    @Override protected void onDestroy(){vaultGeneration++;PrivateVault.wipe(vaultKey);vaultKey=null;saveHandler.removeCallbacks(deferredSave);super.onDestroy();}
+    @Override protected void onDestroy(){vaultGeneration++;PrivateVault.wipe(vaultKey);vaultKey=null;saveHandler.removeCallbacks(deferredSave);saveHandler.removeCallbacks(vaultIdleLock);super.onDestroy();}
     private String page = "home";
     private final Map<String,Integer> images = new HashMap<>();
     private final ArrayList<String> jurisdictions = new ArrayList<>();
@@ -168,7 +175,7 @@ public class MainActivity extends Activity {
                         toast("Vault enrollment could not be confirmed. Close and reopen Path Home. Do not erase the saved plan.");
                         finish();return;
                     }
-                    savePending=false;getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+                    savePending=false;getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);scheduleVaultIdle();
                     show("privacy");toast("Private Vault enabled. Store your passphrase safely; it cannot be reset.");
                     return;
                 }
@@ -182,7 +189,7 @@ public class MainActivity extends Activity {
                     toast("Incorrect passphrase or damaged vault. Saved data unchanged.");return;
                 }finally{PrivateVault.wipe(raw);}
                 profile=next;vaultKey=derived;vaultLocked=false;vaultFailures=0;vaultNextAttempt=0;vaultNotice="";
-                show("home");
+                scheduleVaultIdle();show("home");
             });
         },"path-home-vault-kdf").start();
     }
@@ -201,7 +208,7 @@ public class MainActivity extends Activity {
     }
     private void lockVault(boolean render){
         if(vaultLocked||vaultKey==null)return;
-        saveHandler.removeCallbacks(deferredSave);savePending=false;
+        saveHandler.removeCallbacks(deferredSave);saveHandler.removeCallbacks(vaultIdleLock);savePending=false;
         if(!persistProfile())vaultNotice="Some unsaved changes could not be saved. The last encrypted plan is preserved.";
         PrivateVault.wipe(vaultKey);vaultKey=null;profile=new JSONObject();vaultLocked=true;
         awaitingSaveLocation=false;manualCheck=false;checkInProgress=false;
@@ -755,7 +762,7 @@ public class MainActivity extends Activity {
         add(content,paragraph("Publisher: Genyxis Network. Your plan is encrypted on this phone and is not synced."));
         LinearLayout c=card(content);
         if(vaultEnvelope!=null){
-            title(c,"Private Vault enabled");add(c,paragraph("Your independent passphrase protects the plan in addition to Android Keystore. The protected activity closes when it moves to the background."));
+            title(c,"Private Vault enabled");add(c,paragraph("Your independent passphrase protects the plan in addition to Android Keystore. The protected activity closes when it moves to the background or after five minutes without interaction."));
             add(c,button("Lock my private plan",()->lockVault(true)));
         }else{
             title(c,"Enable Private Vault");add(c,paragraph("Use a separate passphrase of 15 or more characters. If forgotten, your plan cannot be recovered. Keep it safely offline. Older backups may have only device-level protection."));
@@ -769,7 +776,7 @@ public class MainActivity extends Activity {
             .setNegativeButton("Cancel",null).setPositiveButton("Delete",(d,w)->{
                 if(vaultLocked||profileLocked||vaultBusy)return;
                 if(!getPreferences(MODE_PRIVATE).edit().remove("private_plan").commit()){toast("Deletion failed; existing data preserved.");return;}
-                savePending=false;saveHandler.removeCallbacks(deferredSave);PrivateVault.wipe(vaultKey);vaultKey=null;vaultEnvelope=null;profile=new JSONObject();
+                savePending=false;saveHandler.removeCallbacks(deferredSave);saveHandler.removeCallbacks(vaultIdleLock);PrivateVault.wipe(vaultKey);vaultKey=null;vaultEnvelope=null;profile=new JSONObject();
                 getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);show("home");
             }).show()));
     }
