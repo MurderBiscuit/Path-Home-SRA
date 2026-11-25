@@ -5,10 +5,13 @@
 package main
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
 	"math"
+	"log"
+	"runtime"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -170,6 +173,8 @@ var (
 	font, largeFont, titleFont, buttonFont uintptr
 	brush                      uintptr
 	controls                   []uintptr
+	bitmaps                    []uintptr
+	buttonLabels               map[uint32]string
 	fields                     map[string]uintptr
 	clickActions               map[int]func()
 	input                      = state{Checklist: map[string]bool{}}
@@ -182,10 +187,13 @@ var (
 )
 
 func ptr(s string) *uint16                              { return syscall.StringToUTF16Ptr(s) }
+//go:uintptrescapes
 func proc(p *syscall.LazyProc, vals ...uintptr) uintptr { v, _, _ := p.Call(vals...); return v }
 func create(cls, title string, style uint32, x, y, w, h int, parent uintptr, id int) uintptr {
 	v, _, _ := pCreateWindow.Call(0, uintptr(unsafe.Pointer(ptr(cls))), uintptr(unsafe.Pointer(ptr(title))), uintptr(style), uintptr(x), uintptr(y), uintptr(w), uintptr(h), parent, uintptr(id), proc(pGetModule, 0), 0)
-	if parent != 0 {
+	if v == 0 {
+		log.Printf("child window creation failed: class=%s id=%d", cls, id)
+	} else if parent != 0 {
 		controls = append(controls, v)
 	}
 	return v
@@ -205,6 +213,8 @@ func title(x, y, w int, s string) uintptr {
 	return c
 }
 func btn(x, y, w, h int, s string, id int, fn func()) uintptr {
+	// Record the caption before CreateWindowEx can synchronously request painting.
+	buttonLabels[uint32(id)] = s
 	c := create("BUTTON", s, WS_CHILD|WS_VISIBLE|WS_TABSTOP|0x000B, x, y, w, h, hwnd, id)
 	proc(pSendMessage, c, WM_SETFONT, buttonFont, 1)
 	clickActions[id] = fn
@@ -214,7 +224,8 @@ func btn(x, y, w, h int, s string, id int, fn func()) uintptr {
 func paintButton(d *drawItem) {
 	r := d.Rect
 	proc(pFillRect, d.DC, uintptr(unsafe.Pointer(&r)), brush)
-	label := getText(d.HwndItem)
+	// Avoid a synchronous window-message round trip inside WM_DRAWITEM.
+	label := buttonLabels[d.CtlID]
 	nav := d.CtlID >= 100 && d.CtlID < 111
 	secondary := nav || d.CtlID == 900 || d.CtlID == 901 || (d.CtlID >= 510 && d.CtlID <= 516)
 	active := strings.HasPrefix(label, "• ")
@@ -299,7 +310,8 @@ func getText(h uintptr) string {
 	}
 	n := proc(pGetTextLength, h)
 	b := make([]uint16, n+2)
-	proc(pGetText, h, uintptr(len(b)), uintptr(unsafe.Pointer(&b[0])))
+	// GetWindowTextW(HWND, LPWSTR, int): buffer precedes capacity.
+	proc(pGetText, h, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 	return syscall.UTF16ToString(b)
 }
 func money(v string) float64 {
@@ -470,9 +482,17 @@ func clearPanel() {
 		}
 	}
 	controls = nil
+	releaseBitmaps()
+	buttonLabels = map[uint32]string{}
 	fields = map[string]uintptr{}
 	clickActions = map[int]func(){}
 	lastLink = ""
+}
+func releaseBitmaps() {
+	for _, h := range bitmaps {
+		proc(pDeleteObject, h)
+	}
+	bitmaps = nil
 }
 func photo(asset string, x, y int) {
 	p := filepath.Join(assetDir, "photos", asset+".bmp")
@@ -485,7 +505,16 @@ func photo(asset string, x, y int) {
 		width, height = 232, 128
 	}
 	c := create("STATIC", "", WS_CHILD|WS_VISIBLE|SS_BITMAP, x, y, width, height, hwnd, 0)
+	if c == 0 {
+		proc(pDeleteObject, h)
+		return
+	}
 	proc(pSendMessage, c, STM_SETIMAGE, IMAGE_BITMAP, h)
+	bitmaps = append(bitmaps, h)
+	// A static control may make its own bitmap copy; track that handle too.
+	if actual := proc(pSendMessage, c, 0x0173, IMAGE_BITMAP, 0); actual != 0 && actual != h {
+		bitmaps = append(bitmaps, actual)
+	}
 }
 func navGlyph(asset string, x, y, size int) {
 	path := filepath.Join(assetDir, "icons", asset+".bmp")
@@ -494,7 +523,16 @@ func navGlyph(asset string, x, y, size int) {
 		return
 	}
 	c := create("STATIC", "", WS_CHILD|WS_VISIBLE|SS_BITMAP, x, y, size, size, hwnd, 0)
+	if c == 0 {
+		proc(pDeleteObject, h)
+		return
+	}
 	proc(pSendMessage, c, STM_SETIMAGE, IMAGE_BITMAP, h)
+	bitmaps = append(bitmaps, h)
+	// A static control may make its own bitmap copy; track that handle too.
+	if actual := proc(pSendMessage, c, 0x0173, IMAGE_BITMAP, 0); actual != 0 && actual != h {
+		bitmaps = append(bitmaps, actual)
+	}
 }
 func nav(target string) {
 	if !save(true) {
@@ -958,6 +996,10 @@ func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 			}
 		}
 	case WM_COMMAND:
+		// Only button-click notifications (BN_CLICKED) invoke these actions.
+		if l == 0 || (w>>16)&0xffff != 0 {
+			break
+		}
 		id := int(w & 0xffff)
 		if fn, ok := clickActions[id]; ok {
 			fn()
@@ -979,43 +1021,75 @@ func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 	}
 	return proc(pDefWindowProc, h, uintptr(msg), w, l)
 }
-func prepareAssets() string {
-	dir, _ := os.UserCacheDir()
-	dir = filepath.Join(dir, "ReentryNavigator", "art")
-	os.MkdirAll(filepath.Join(dir, "photos"), 0700)
-	for _, name := range []string{"hero", "release_plan", "appointments", "local_help", "money", "family", "progress"} {
-		dest := filepath.Join(dir, "photos", name+".bmp")
-		if _, err := os.Stat(dest); err != nil {
-			b, _ := bundled.ReadFile("assets/photos/" + name + ".bmp")
-			os.WriteFile(dest, b, 0600)
+func prepareAssets() (string, error) {
+	dir, err := os.UserCacheDir()
+	if err != nil { return "", err }
+	dir = filepath.Join(dir, "PathHome", "art")
+	for _, group := range []string{"photos", "icons"} {
+		if err := os.MkdirAll(filepath.Join(dir, group), 0700); err != nil { return "", err }
+		entries, err := bundled.ReadDir("assets/" + group)
+		if err != nil { return "", err }
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".bmp") { continue }
+			b, err := bundled.ReadFile("assets/" + group + "/" + entry.Name())
+			if err != nil { return "", err }
+			dest := filepath.Join(dir, group, entry.Name())
+			// Reuse verified bytes; repair only derived cache files, not private profiles.
+			if current, err := os.ReadFile(dest); err == nil && bytes.Equal(current, b) { continue }
+			if err := os.WriteFile(dest, b, 0600); err != nil { return "", err }
 		}
 	}
-	os.MkdirAll(filepath.Join(dir, "icons"), 0700)
-	for _, name := range []string{"brand", "home", "plan", "law", "ask", "help", "money", "family", "appointments", "progress", "stay", "privacy", "documents"} {
-		dest := filepath.Join(dir, "icons", name+".bmp")
-		b, _ := bundled.ReadFile("assets/icons/" + name + ".bmp")
-		// Always refresh branded art even if a previous version was cached.
-		if len(b) > 0 {
-			os.WriteFile(dest, b, 0600)
-		}
-	}
-	ico, _ := bundled.ReadFile("assets/PathHome.ico")
-	if len(ico) > 0 {
-		os.WriteFile(filepath.Join(dir, "PathHome.ico"), ico, 0600)
-	}
-	return dir
+	ico, err := bundled.ReadFile("assets/PathHome.ico")
+	if err != nil { return "", err }
+	if err := os.WriteFile(filepath.Join(dir, "PathHome.ico"), ico, 0600); err != nil { return "", err }
+	return dir, nil
 }
 func main() {
-	b, _ := bundled.ReadFile("assets/reentry-public.json")
-	json.Unmarshal(b, &data)
+	// Win32 windows and their message queue belong to the creating OS thread.
+	runtime.LockOSThread()
+	os.Exit(run())
+}
+func run() (exitCode int) {
+	// Local diagnostic metadata only; never log plan text or user input.
+	if dir, err := os.UserCacheDir(); err == nil {
+		dir = filepath.Join(dir, "PathHome")
+		if os.MkdirAll(dir, 0700) == nil {
+			if f, err := os.OpenFile(filepath.Join(dir, "startup.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
+				defer f.Close()
+				log.SetOutput(f)
+			}
+		}
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("fatal runtime failure: type=%T", p)
+			exitCode = 1
+		}
+		log.Printf("shutdown exit=%d", exitCode)
+	}()
+	log.Print("startup: loading bundled reference data")
+	b, err := bundled.ReadFile("assets/reentry-public.json")
+	if err != nil || json.Unmarshal(b, &data) != nil {
+		log.Print("startup: bundled reference data invalid")
+		alert("Path Home reference data could not be loaded. Please use a verified application build.")
+		return 1
+	}
+	log.Print("startup: opening local profile")
 	if err := loadPrivatePlan(); err != nil {
+		log.Print("startup: secure profile could not be opened")
 		alert("Your saved plan needs attention: " + err.Error() + "\nExisting data has not been overwritten.")
-		return
+		return 1
 	}
 	if input.Checklist == nil {
 		input.Checklist = map[string]bool{}
 	}
-	assetDir = prepareAssets()
+	log.Print("startup: preparing local art")
+	assetDir, err = prepareAssets()
+	if err != nil {
+		log.Print("startup: asset preparation failed")
+		alert("Path Home could not prepare its local art. Your private plan was not deleted.")
+		return 1
+	}
 	inst := proc(pGetModule, 0)
 	bg := proc(pCreateBrush, 0x00F7F6F1)
 	brush = bg
@@ -1025,27 +1099,41 @@ func main() {
 	smallIcon := proc(pLoadImage, 0, uintptr(unsafe.Pointer(iconPath)), IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
 	wc := wndClass{CbSize: uint32(unsafe.Sizeof(wndClass{})), WndProc: syscall.NewCallback(wndproc), Instance: inst, BgBrush: bg, ClassName: cName, Icon: bigIcon, SmallIcon: smallIcon}
 	if proc(pRegisterClass, uintptr(unsafe.Pointer(&wc))) == 0 {
+		log.Print("startup: window class registration failed")
 		alert("Could not register Windows app window.")
-		return
+		return 1
 	}
-	h, _, _ := pCreateWindow.Call(0, uintptr(unsafe.Pointer(cName)), uintptr(unsafe.Pointer(ptr("Path Home: Structural Reentry Assistance | Start Here"))), WS_OVERLAPPEDWINDOW|WS_VISIBLE, 90, 65, 1130, 840, 0, 0, inst, 0)
+	log.Print("startup: creating main window")
+	h, _, createErr := pCreateWindow.Call(0, uintptr(unsafe.Pointer(cName)), uintptr(unsafe.Pointer(ptr("Path Home: Structural Reentry Assistance | Start Here"))), WS_OVERLAPPEDWINDOW, 90, 65, 1130, 840, 0, 0, inst, 0)
 	if h == 0 {
-		return
+		log.Printf("startup: main window creation failed: %v", createErr)
+		alert("Path Home could not create its main window.")
+		return 1
 	}
 	hwnd = h
 	font = proc(pCreateFont, 21, 0, 0, 0, 480, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	buttonFont = proc(pCreateFont, 18, 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	largeFont = proc(pCreateFont, 28, 0, 0, 0, 650, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
 	titleFont = proc(pCreateFont, 33, 0, 0, 0, 730, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(ptr("Segoe UI"))))
+	defer func() {
+		releaseBitmaps()
+		for _, obj := range []uintptr{font, buttonFont, largeFont, titleFont, brush} {
+			if obj != 0 { proc(pDeleteObject, obj) }
+		}
+	}()
+	log.Print("startup: rendering home")
 	draw()
 	proc(pShowWindow, h, 5)
 	proc(pUpdateWindow, h)
+	log.Print("startup: entering GUI message loop")
 	var m message
 	for {
-		v, _, _ := pGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
-		if int32(v) <= 0 {
-			break
+		v, _, err := pGetMessage.Call(uintptr(unsafe.Pointer(&m)), 0, 0, 0)
+		if int32(v) == -1 {
+			log.Printf("message loop failure: %v", err)
+			return 1
 		}
+		if int32(v) == 0 { return 0 }
 		proc(pTranslateMessage, uintptr(unsafe.Pointer(&m)))
 		proc(pDispatchMessage, uintptr(unsafe.Pointer(&m)))
 	}
