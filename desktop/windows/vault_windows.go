@@ -20,6 +20,8 @@ var (
  vaultPendingLock bool
  vaultNextAttempt time.Time
  vaultFailures int
+ vaultIdleAvailable bool
+ vaultCaptureProtected bool
  wts = syscall.NewLazyDLL("wtsapi32.dll")
  wtsRegister = wts.NewProc("WTSRegisterSessionNotification")
  wtsUnregister = wts.NewProc("WTSUnRegisterSessionNotification")
@@ -46,6 +48,12 @@ func takeVaultPassword(c uintptr)string{
  proc(pSetText,c,uintptr(unsafe.Pointer(ptr(""))))
  return p
 }
+func protectVaultWindow(){
+ // Best-effort screenshot exclusion; not a security boundary against malware.
+ p:=user32.NewProc("SetWindowDisplayAffinity")
+ vaultCaptureProtected=proc(p,hwnd,0x11)!=0
+ if !vaultCaptureProtected {vaultCaptureProtected=proc(p,hwnd,1)!=0}
+}
 func enableVault(pass,confirm string){
  if len(vaultEnvelope)>0 || len(vaultKey)>0 {return}
  if !validVaultPassphrase(pass)||pass!=confirm{
@@ -65,6 +73,7 @@ func enableVault(pass,confirm string){
   return
  }
  vaultLastActivity=time.Now()
+ protectVaultWindow()
  draw()
  alert("Private Vault enabled. Keep your passphrase somewhere safe. Genyxis cannot recover it.")
 }
@@ -131,9 +140,14 @@ func drawVaultUnlock(){
 func drawPrivacy(x,w int){
  title(x,118,w,"Privacy & Private Vault")
  if len(vaultEnvelope)>0 {
-  paragraph(x,175,745,"Your plan is protected by your passphrase and Windows account encryption. Lock it now or it locks after five minutes without interaction with Path Home.",4)
+  description:="Your plan is protected by your passphrase and Windows account encryption. Lock it now or it locks after five minutes without interaction with Path Home."
+  if !vaultIdleAvailable {description="Your plan has two encryption layers, but the idle timer is unavailable. Lock it manually whenever you leave the app."}
+  paragraph(x,175,745,description,4)
   btn(x,310,300,55,"Lock my private plan",1303,func(){lockPrivateVault(false)})
   paragraph(x,390,745,"A compromised unlocked device can still expose what you see and type. Keep your passphrase offline and use a trusted device.",4)
+  captureStatus:="Screen capture exclusion requested from Windows."
+  if !vaultCaptureProtected {captureStatus="Windows screen capture exclusion is unavailable."}
+  paragraph(x,520,745,captureStatus,2)
  }else{
   paragraph(x,175,745,"Add an independent passphrase to your Windows-encrypted plan. If you forget it, Genyxis cannot recover your data. Use at least 15 characters; five or more random words are better.",4)
   text(x,302,700,28,"New vault passphrase",true)
