@@ -1139,6 +1139,7 @@ func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 			return 0
 		}
 	case 0x0113: // WM_TIMER
+		if w!=1 {break}
 		if !vaultLocked && len(vaultKey)>0 && (vaultPendingLock || time.Since(vaultLastActivity)>=vaultIdle) {lockPrivateVault(true)}
 		return 0
 	case 0x02B1: // WM_WTSSESSION_CHANGE
@@ -1263,7 +1264,9 @@ func run() (exitCode int) {
 		}
 	}()
 	vaultLastActivity=time.Now()
-	if proc(user32.NewProc("SetTimer"),h,1,1000,0)==0 {log.Print("vault idle timer unavailable")}
+	vaultIdleAvailable=proc(user32.NewProc("SetTimer"),h,1,1000,0)!=0
+	if !vaultIdleAvailable {log.Print("vault idle timer unavailable")}
+	if vaultLocked {protectVaultWindow()}
 	defer proc(user32.NewProc("KillTimer"),h,1)
 	if proc(wtsRegister,h,0)!=0 {defer proc(wtsUnregister,h)} else {log.Print("session lock notification unavailable")}
 	log.Print("startup: rendering home")
