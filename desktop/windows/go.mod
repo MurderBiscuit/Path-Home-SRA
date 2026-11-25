@@ -1,3 +1,3 @@
 module example.org/reentry-native-windows
 
-go 1.23
+go 1.24.0
