@@ -47,6 +47,8 @@ var (
 	pMessageBox       = user32.NewProc("MessageBoxW")
 	pLoadImage        = user32.NewProc("LoadImageW")
 	pSetBkMode        = gdi32.NewProc("SetBkMode")
+	pSetBkColor       = gdi32.NewProc("SetBkColor")
+	pInvalidateRect   = user32.NewProc("InvalidateRect")
 	pSetTextColor     = gdi32.NewProc("SetTextColor")
 	pCreateFont       = gdi32.NewProc("CreateFontW")
 	pCreateBrush      = gdi32.NewProc("CreateSolidBrush")
@@ -116,6 +118,9 @@ type wndClass struct {
 	SmallIcon                       uintptr
 }
 type state struct {
+	Theme string `json:"theme,omitempty"`
+	// Nil map denotes a legacy profile: zero-valued amounts are conservatively unknown.
+	BudgetKnown map[string]bool `json:"budgetKnown,omitempty"`
 	StayEnabled     bool            `json:"stayEnabled"`
 	State           string          `json:"state"`
 	County          string          `json:"county"`
@@ -172,6 +177,9 @@ var (
 	hwnd                       uintptr
 	font, largeFont, titleFont, buttonFont uintptr
 	brush                      uintptr
+	activePalette = palettes[0]
+	// Retain the class background brush for the lifetime of the registered window class.
+	classBrush uintptr
 	controls                   []uintptr
 	bitmaps                    []uintptr
 	buttonLabels               map[uint32]string
@@ -186,6 +194,36 @@ var (
 	lastLink                   string
 )
 
+type visualPalette struct {
+	ID, Name string
+	Background, Ink, Primary, PrimaryInk, Secondary, SecondaryInk, Edge uintptr
+}
+// RGB values are converted to Win32 COLORREF (BGR). Accent colors never replace the Path Home logo.
+func rgb(v uintptr) uintptr { return (v&0xff)<<16 | v&0xff00 | (v>>16)&0xff }
+var palettes = []visualPalette{
+	{"classic", "Path Home Classic", 0xf1f6f7, 0x26303a, 0x0e7063, 0xffffff, 0xedf6f3, 0x122a3e, 0xa5c9bf},
+	{"aurora", "Aurora Pulse", 0xf0f5ff, 0x172344, 0x5331b8, 0xffffff, 0xd9faff, 0x263768, 0x9455ff},
+	{"prismatic", "Prismatic Riot", 0xfff5f8, 0x3f203e, 0x962755, 0xffffff, 0xffe152, 0x412031, 0xff4f91},
+	{"solar", "Solar Flare", 0xfff7ed, 0x44251c, 0xa43d13, 0xffffff, 0xffcb52, 0x41231c, 0xfa3f93},
+	{"abyss", "Abyss Current", 0xeff8ff, 0x132b50, 0x1556a8, 0xffffff, 0xc2f7f6, 0x123552, 0x2f80ff},
+	{"nebula", "Nebula Orchid", 0xf6f1ff, 0x33204d, 0x6332a5, 0xffffff, 0xf4d8fc, 0x392454, 0xb99aff},
+	{"crimson", "Crimson Ember", 0xfff3ed, 0x42202c, 0xa32644, 0xffffff, 0xffcb70, 0x482228, 0xf43f5e},
+	{"bio", "Bio-Luminescence", 0xf0fbf4, 0x173a30, 0x176449, 0xffffff, 0xbff5c0, 0x173a30, 0x14e6bd},
+}
+func paletteFor(id string) visualPalette {
+	for _, p := range palettes { if p.ID == id { return p } }
+	return palettes[0]
+}
+func applyTheme() {
+	activePalette = paletteFor(input.Theme)
+	next := proc(pCreateBrush, rgb(activePalette.Background))
+	if next == 0 { return }
+	old := brush
+	brush = next
+	// The original class brush remains valid until process exit.
+	if old != 0 && old != classBrush { proc(pDeleteObject, old) }
+	proc(pInvalidateRect, hwnd, 0, 1)
+}
 func ptr(s string) *uint16                              { return syscall.StringToUTF16Ptr(s) }
 //go:uintptrescapes
 func proc(p *syscall.LazyProc, vals ...uintptr) uintptr { v, _, _ := p.Call(vals...); return v }
@@ -227,15 +265,12 @@ func paintButton(d *drawItem) {
 	// Avoid a synchronous window-message round trip inside WM_DRAWITEM.
 	label := buttonLabels[d.CtlID]
 	nav := d.CtlID >= 100 && d.CtlID < 111
-	secondary := nav || d.CtlID == 900 || d.CtlID == 901 || (d.CtlID >= 510 && d.CtlID <= 516)
+	secondary := nav || d.CtlID == 900 || d.CtlID == 901 || d.CtlID == 903 || (d.CtlID >= 510 && d.CtlID <= 516)
 	active := strings.HasPrefix(label, "• ")
-	fill, edge, ink := uintptr(0x0063700e), uintptr(0x004e5809), uintptr(0x00ffffff)
-	if secondary && !active {
-		fill, edge, ink = 0x00f3f6ed, 0x00bfc9a5, 0x003e2a12
-	}
-	if d.ItemState&1 != 0 {
-		if secondary && !active { fill = 0x00dcebe1 } else { fill = 0x004e5809 }
-	}
+	p := activePalette
+	fill, edge, ink := rgb(p.Primary), rgb(p.Edge), rgb(p.PrimaryInk)
+	if secondary && !active { fill, edge, ink = rgb(p.Secondary), rgb(p.Edge), rgb(p.SecondaryInk) }
+	if d.ItemState&1 != 0 { edge = rgb(p.Ink) }
 	if d.ItemState&4 != 0 { fill, edge, ink = 0x00e7e7e7, 0x00cccccc, 0x00666666 }
 	b := proc(pCreateBrush, fill)
 	pen := proc(pCreatePen, 0, 1, edge)
@@ -292,12 +327,16 @@ func fieldText(k string) string {
 	case "appointmentText":
 		return input.AppointmentText
 	case "cash":
+		if !budgetAmountKnown("cash", input.Cash) { return "" }
 		return fmt.Sprintf("%.2f", input.Cash)
 	case "birthCost":
+		if !budgetAmountKnown("birthCost", input.BirthCost) { return "" }
 		return fmt.Sprintf("%.2f", input.BirthCost)
 	case "idCost":
+		if !budgetAmountKnown("idCost", input.IDCost) { return "" }
 		return fmt.Sprintf("%.2f", input.IDCost)
 	case "otherCost":
+		if !budgetAmountKnown("otherCost", input.OtherCost) { return "" }
 		return fmt.Sprintf("%.2f", input.OtherCost)
 	case "asked":
 		return input.Asked
@@ -315,6 +354,10 @@ func getText(h uintptr) string {
 	// GetWindowTextW(HWND, LPWSTR, int): buffer precedes capacity.
 	proc(pGetText, h, uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 	return syscall.UTF16ToString(b)
+}
+func budgetAmountKnown(key string, amount float64) bool {
+	if input.BudgetKnown != nil { if known, exists := input.BudgetKnown[key]; exists { return known } }
+	return amount > 0 // Legacy zero cannot be distinguished from an unknown fee.
 }
 func money(v string) float64 {
 	n, _ := strconv.ParseFloat(strings.TrimSpace(strings.ReplaceAll(v, "$", "")), 64)
@@ -348,12 +391,20 @@ func syncFields() {
 		case "appointmentText":
 			input.AppointmentText = v
 		case "cash":
+			if input.BudgetKnown == nil { input.BudgetKnown = map[string]bool{} }
+			input.BudgetKnown[key] = v != ""
 			input.Cash = money(v)
 		case "birthCost":
+			if input.BudgetKnown == nil { input.BudgetKnown = map[string]bool{} }
+			input.BudgetKnown[key] = v != ""
 			input.BirthCost = money(v)
 		case "idCost":
+			if input.BudgetKnown == nil { input.BudgetKnown = map[string]bool{} }
+			input.BudgetKnown[key] = v != ""
 			input.IDCost = money(v)
 		case "otherCost":
+			if input.BudgetKnown == nil { input.BudgetKnown = map[string]bool{} }
+			input.BudgetKnown[key] = v != ""
 			input.OtherCost = money(v)
 		case "asked":
 			input.Asked = v
@@ -439,6 +490,14 @@ func save(silent bool) bool {
 			}
 		}
 	}
+	// Restore the previously accepted state if validation or encrypted write fails.
+	previous := input
+	if input.BudgetKnown != nil {
+		previous.BudgetKnown = make(map[string]bool, len(input.BudgetKnown))
+		for k, v := range input.BudgetKnown { previous.BudgetKnown[k] = v }
+	}
+	committed := false
+	defer func() { if !committed { input = previous } }()
 	syncFields()
 	if !knownJurisdiction(input.State, data.Jurisdictions) {
 		alert("Use a valid two-letter state abbreviation for where you live (for example MI), or leave blank. Enter federal supervised release in the supervision field.")
@@ -460,6 +519,7 @@ func save(silent bool) bool {
 		alert("Could not securely save your plan: " + err.Error())
 		return false
 	}
+	committed = true
 	if !silent {
 		alert("Saved securely for this Windows account. This is not a synced account.")
 	}
@@ -470,14 +530,14 @@ func invalidDate(v string) bool {
 	if v == "" {
 		return false
 	}
-	_, e := time.Parse("2006-01-02", v)
-	return e != nil
+	t, e := time.Parse("2006-01-02", v)
+	return e != nil || t.Format("2006-01-02") != v
 }
 func alert(msg string) {
 	proc(pMessageBox, hwnd, uintptr(unsafe.Pointer(ptr(msg))), uintptr(unsafe.Pointer(ptr("Path Home"))), 0)
 }
 func clearPanel() {
-	syncFields()
+	// State is committed explicitly by actions; redrawing must not silently accept invalid fields.
 	for _, c := range controls {
 		if c != 0 {
 			proc(pDestroyWindow, c)
@@ -596,9 +656,10 @@ func draw() {
 	clearPanel()
 	navGlyph("brand", 35, 13, 72)
 	title(115, 19, 750, "PATH HOME · STRUCTURAL REENTRY ASSISTANCE")
-	text(115, 64, 850, 30, "Your next step, made clear.    |    Not a government service · Private local tools", false)
+	text(115, 64, 750, 30, "Your next step, made clear.    |    Not a government service · Private local tools", false)
 	addNav(22, 128)
 	btn(883, 22, 194, 45, "Our Mission", 900, func() { nav("mission") })
+	btn(883, 74, 194, 34, "Appearance", 903, func() { nav("appearance") })
 	x := 284
 	w := 788
 	switch page {
@@ -606,6 +667,8 @@ func draw() {
 		drawHome(x, w)
 	case "mission":
 		drawMission(x, w)
+	case "appearance":
+		drawAppearance(x, w)
 	case "plan":
 		drawPlan(x, w)
 	case "ask":
@@ -627,10 +690,28 @@ func draw() {
 	case "library":
 		drawLibrary(x, w)
 	}
-	text(286, 728, 835, 29, "General information only. Check signed release conditions and official agency instructions.", false)
-	text(286, 756, 650, 22, "Published by Genyxis Network", false)
+	text(286, 744, 790, 25, "General information only. Check signed release conditions and official agency instructions.", false)
+	text(286, 773, 650, 22, "Published by Genyxis Network", false)
 }
 
+func drawAppearance(x, w int) {
+	title(x, 118, w, "Make Path Home yours")
+	paragraph(x, 172, 745, "Choose a visual palette. Your selection stays on this device. The original logo, mission and navigation remain unchanged.", 3)
+	for i, p := range palettes {
+		p := p
+		label := p.Name
+		if p.ID == activePalette.ID { label = "• " + label }
+		btn(x+(i%2)*380, 275+(i/2)*82, 355, 64, label, 910+i, func() {
+			previous := input.Theme
+			input.Theme = p.ID
+			if !save(true) { input.Theme = previous; return }
+			applyTheme()
+			draw()
+		})
+	}
+	text(x, 625, 740, 30, "Current palette: "+activePalette.Name, true)
+	btn(x, 671, 250, 45, "Return Home", 920, func() { nav("home") })
+}
 func drawMission(x, w int) {
 	title(x, 115, w, "Our Mission")
 	text(x, 168, 760, 28, "Because freedom deserves a fighting chance.", true)
@@ -670,7 +751,7 @@ func drawHome(x, w int) {
 	btn(x+545, 646, 225, 43, "Stuck? Find a way forward", 430, func() { nav("unstuck") })
 	btn(x+545, 692, 225, 33, "Read Our Mission", 901, func() { nav("mission") })
 	title(x, 635, 530, "My supervision timeline")
-	paragraph(x, 683, 775, timelineLabel(), 2)
+	paragraph(x, 683, 520, timelineLabel(), 2)
 }
 
 func timelineLabel() string {
@@ -779,7 +860,7 @@ func drawAppointments(x, w int) {
 	text(x, 378, 700, 30, "What is this appointment? Where do you need to go?", false)
 	edit("appointmentText", x, 411, 720, 111, true)
 	btn(x, 554, 290, 55, "Save appointment", 375, func() { save(false) })
-	btn(x+315, 554, 250, 55, "Check my dates", 376, func() { syncFields(); draw() })
+	btn(x+315, 554, 250, 55, "Check my dates", 376, func() { if save(true) { draw() } })
 	title(x, 633, 720, "Your next appointment")
 	appt := input.AppointmentDate
 	if appt == "" {
@@ -803,8 +884,15 @@ func drawMoney(x, w int) {
 	if need < 0 {
 		need = 0
 	}
-	title(x, 515, 745, fmt.Sprintf("Estimated still needed: $%.2f", need))
-	text(x, 563, 760, 32, "A blank or zero estimate is NOT proof of a free document; confirm fees and waivers.", false)
+	complete := budgetAmountKnown("cash", input.Cash) && budgetAmountKnown("birthCost", input.BirthCost) && budgetAmountKnown("idCost", input.IDCost) && budgetAmountKnown("otherCost", input.OtherCost)
+	if complete {
+		title(x, 515, 745, fmt.Sprintf("Estimated still needed: $%.2f", need))
+	} else if !budgetAmountKnown("cash", input.Cash) {
+		title(x, 515, 745, "Partial estimate — available money unknown")
+	} else {
+		title(x, 515, 745, fmt.Sprintf("Partial shortfall (fees missing): $%.2f", need))
+	}
+	paragraph(x, 565, 740, "Leave unknown amounts blank. Enter zero only for a known zero amount. Confirm fees and waivers.", 2)
 	btn(x, 620, 260, 56, "Update my budget", 380, func() {
 		if save(true) {
 			draw()
@@ -849,7 +937,7 @@ func drawHelp(x, w int) {
 			r := matches[i]
 			yy := 390 + (i-start)*89
 			text(x, yy, 552, 24, firstN(r.Name, 67), true)
-			text(x, yy+24, 748, 24, "Phone: "+r.Phone+"  |  "+firstN(r.Scope, 72), false)
+			text(x, yy+24, 560, 24, "Phone: "+r.Phone+"  |  "+firstN(r.Scope, 72), false)
 			text(x, yy+48, 748, 23, "Before you go: "+firstN(r.BeforeYouGo, 91), false)
 			btn(x+573, yy, 165, 39, "Official details", 530+i-start, func() { link(r.Website) })
 		}
@@ -872,7 +960,7 @@ func drawFamily(x, w int) {
 		xx := x + (i%2)*385
 		yy := 300 + (i/2)*65
 		id := 600 + i
-		c := create("BUTTON", t, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, xx, yy, 368, 51, hwnd, id)
+		c := create("BUTTON", t, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|0x2000, xx, yy, 368, 51, hwnd, id)
 		proc(pSendMessage, c, WM_SETFONT, font, 1)
 		if input.Checklist[t] {
 			proc(pSendMessage, c, BM_SETCHECK, 1, 0)
@@ -897,7 +985,7 @@ func drawProgress(x, w int) {
 	for i, t := range tasks {
 		y := 300 + i*48
 		id := 700 + i
-		c := create("BUTTON", t, WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX, x, y, 755, 42, hwnd, id)
+		c := create("BUTTON", t, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX, x, y, 755, 42, hwnd, id)
 		proc(pSendMessage, c, WM_SETFONT, font, 1)
 		if input.Checklist[t] {
 			proc(pSendMessage, c, BM_SETCHECK, 1, 0)
@@ -971,7 +1059,7 @@ func drawStay(x, w int) {
 	} else {
 		text(x, 274, 755, 33, "Optional reminder: OFF", true)
 	}
-	btn(x, 330, 320, 53, "Turn reminders on / off", 431, func() { input.StayEnabled = !input.StayEnabled; save(true); draw() })
+	btn(x, 330, 320, 53, "Turn reminders on / off", 431, func() { old := input.StayEnabled; input.StayEnabled = !old; if save(true) { draw() } else { input.StayEnabled = old } })
 	text(x, 417, 755, 36, "Are you in the right place, and the right time?", true)
 	text(x, 456, 755, 30, "Just checking on you!", true)
 	paragraph(x, 511, 755, "You've worked hard to get this far. Take a moment to think about where you're going and what matters most to you.", 3)
@@ -1008,9 +1096,25 @@ func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 			return 0
 		}
 	case WM_CTLCOLORSTATIC:
-		proc(pSetBkMode, w, 1)
-		proc(pSetTextColor, w, 0x002d3036)
+		// Read-only EDIT uses WM_CTLCOLORSTATIC. Opaque text with matching brush prevents scroll ghosting.
+		proc(pSetBkMode, w, 2)
+		proc(pSetBkColor, w, rgb(activePalette.Background))
+		proc(pSetTextColor, w, rgb(activePalette.Ink))
 		return brush
+	case 0x0014: // WM_ERASEBKGND: theme-aware canvas rather than stale class brush.
+		var r buttonRect
+		if proc(user32.NewProc("GetClientRect"), h, uintptr(unsafe.Pointer(&r))) != 0 {
+			proc(pFillRect, w, uintptr(unsafe.Pointer(&r)), brush)
+			return 1
+		}
+	case 0x0024: // WM_GETMINMAXINFO; fixed-coordinate layout must not be shrunk below its canvas.
+		if l != 0 {
+			var mm [5]point
+			proc(pCopyMemory, uintptr(unsafe.Pointer(&mm[0])), l, unsafe.Sizeof(mm))
+			mm[3] = point{1130, 850}
+			proc(pCopyMemory, l, uintptr(unsafe.Pointer(&mm[0])), unsafe.Sizeof(mm))
+			return 0
+		}
 	case WM_CLOSE:
 		if !save(true) {
 			return 0
@@ -1093,8 +1197,10 @@ func run() (exitCode int) {
 		return 1
 	}
 	inst := proc(pGetModule, 0)
-	bg := proc(pCreateBrush, 0x00F7F6F1)
+	activePalette = paletteFor(input.Theme)
+	bg := proc(pCreateBrush, rgb(activePalette.Background))
 	brush = bg
+	classBrush = bg
 	cName := ptr("ReentryNavigatorNativeDesktop")
 	iconPath := ptr(filepath.Join(assetDir, "PathHome.ico"))
 	bigIcon := proc(pLoadImage, 0, uintptr(unsafe.Pointer(iconPath)), IMAGE_ICON, 64, 64, LR_LOADFROMFILE)
@@ -1106,7 +1212,7 @@ func run() (exitCode int) {
 		return 1
 	}
 	log.Print("startup: creating main window")
-	h, _, createErr := pCreateWindow.Call(0, uintptr(unsafe.Pointer(cName)), uintptr(unsafe.Pointer(ptr("Path Home: Structural Reentry Assistance | Start Here"))), WS_OVERLAPPEDWINDOW, 90, 65, 1130, 840, 0, 0, inst, 0)
+	h, _, createErr := pCreateWindow.Call(0, uintptr(unsafe.Pointer(cName)), uintptr(unsafe.Pointer(ptr("Path Home: Structural Reentry Assistance | Start Here"))), WS_OVERLAPPEDWINDOW, 90, 65, 1130, 850, 0, 0, inst, 0)
 	if h == 0 {
 		log.Printf("startup: main window creation failed: %v", createErr)
 		alert("Path Home could not create its main window.")
