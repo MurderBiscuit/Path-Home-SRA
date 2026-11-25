@@ -262,7 +262,9 @@ func edit(key string, x, y, w, h int, multiline bool) uintptr {
 	if multiline {
 		style |= ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL
 	}
-	c := create("EDIT", fieldText(key), style, x, y, w, h, hwnd, 0)
+	// Stable IDs let runtime tests locate actual edit controls without relying on Z-order.
+	ids := map[string]int{"state":1200, "county":1201, "zip":1202, "release":1203, "start":1204, "end":1205, "supervision":1206, "support":1207, "appointmentDate":1208, "appointmentText":1209, "cash":1210, "birthCost":1211, "idCost":1212, "otherCost":1213, "asked":1214, "unstuckGoal":1215}
+	c := create("EDIT", fieldText(key), style, x, y, w, h, hwnd, ids[key])
 	proc(pSendMessage, c, WM_SETFONT, font, 1)
 	fields[key] = c
 	return c
