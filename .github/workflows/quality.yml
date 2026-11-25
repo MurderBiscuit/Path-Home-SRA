@@ -95,8 +95,9 @@ jobs:
       - name: Android Java business-rule tests
         run: |
           mkdir -p /tmp/pathhome-rules
-          javac -d /tmp/pathhome-rules android/app/src/main/java/org/pathhome/sra/WorkflowRules.java android/qa/WorkflowRulesTest.java
+          javac -d /tmp/pathhome-rules android/app/src/main/java/org/pathhome/sra/WorkflowRules.java android/app/src/main/java/org/pathhome/sra/PrivateVault.java android/qa/WorkflowRulesTest.java android/qa/PrivateVaultTest.java
           java -cp /tmp/pathhome-rules org.pathhome.sra.WorkflowRulesTest
+          java -cp /tmp/pathhome-rules org.pathhome.sra.PrivateVaultTest
       - name: Compile native Android debug APK (not for distribution)
         working-directory: android
         run: gradle --no-daemon :app:assembleDebug
