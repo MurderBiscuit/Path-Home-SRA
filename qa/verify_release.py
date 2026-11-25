@@ -43,7 +43,7 @@ check('Android supervision end validation blocks next step', 'if(!WorkflowRules.
 check('Android appointment requires real date and time', 'if(d.isEmpty())' in java and 'if(!t.matches' in java and 'Confirm all details against the original notice' in java)
 check('Android money distinguishes incomplete fee estimates', 'Partial shortfall (fees missing)' in java and 'WorkflowRules.validMoney' in java)
 check('Android location stays optional and local', 'Are you in the right place, and the right time?' in java and 'permission.ACCESS_BACKGROUND_LOCATION' not in manifest)
-check('Windows refuses navigation if encrypted save fails', 'if !save(true) {' in go and 'if !save(true) {\n\t\t\treturn 0' in go)
+check('Windows refuses navigation if encrypted save fails', 'if !save(true) {' in go and 'if !vaultLocked && !save(true) {\n\t\t\treturn 0' in go)
 check('Windows invalid money is not silently zeroed on save', 'validateMoneyField(getText(c))' in go)
 check('Windows legal question results redraw rather than stacking', 'if save(true) {\n\t\t\tdraw()' in go)
 check('Windows reporting/legal warning shown', 'signed release conditions' in go.lower())
@@ -52,6 +52,20 @@ peoff=struct.unpack_from('<I',pe,0x3c)[0]
 check('Installable Windows PE executable with icon resource',pe[:2]==b'MZ' and pe[peoff:peoff+4]==b'PE\0\0' and b'.rsrc\0' in pe[:8192])
 check('No .env or key material in tracked source',not any(x.is_file() and (x.name.endswith('.pem') or x.name=='.env' or x.name.endswith('.key')) for x in root.rglob('*')))
 check('GitHub public repository excludes actual profiles',not list(root.rglob('plan.dpapi')) and not list(root.rglob('plan.json')))
+
+# These are structural checks only; executable vault tests run in Go/JVM and native Windows CI.
+vault_go=(root/'desktop/windows/vault.go').read_text()
+vault_win=(root/'desktop/windows/vault_windows.go').read_text()
+vault_java=(root/'android/app/src/main/java/org/pathhome/sra/PrivateVault.java').read_text()
+check('Vault uses standard authenticated encryption and independent key derivation on both platforms',
+      'pbkdf2.Key' in vault_go and 'vaultRounds = 600000' in vault_go and 'NewGCMWithRandomNonce' in vault_go
+      and 'PBKDF2WithHmacSHA256' in vault_java and '600000' in vault_java and 'AES/GCM/NoPadding' in vault_java)
+check('Windows vault keeps account encryption and refuses locked writes',
+      'if vaultLocked { return fmt.Errorf("private vault is locked") }' in go and 'protectLocal(payload)' in go
+      and 'clear(vaultKey)' in vault_win and 'vaultIdle = 5*time.Minute' in vault_win)
+check('Android vault retains Keystore encryption and blocks locked writes',
+      'PrivateVault.seal' in java and 'encrypt(payload)' in java and 'if(profileLocked||vaultLocked)' in java
+      and 'FLAG_SECURE' in java and 'PrivateVault.wipe(vaultKey)' in java)
 
 # Prevent the duplicate Android lifecycle override that passed source-only checks in v0.9.5.
 android_top_level_methods=re.findall(r'^    (?:@Override\s+)?(?:public|private|protected)\s+(?:(?:static|final|synchronized)\s+)*(?:[\w<>\[\].]+)\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(([^)]*)\)',java,re.M)
