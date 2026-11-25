@@ -41,13 +41,13 @@ function Navigate([IntPtr]$Window, [int]$Button, [int]$Expected) {
     [void](Require-Control $Window $Expected)
 }
 function Set-State([IntPtr]$Window) {
-    $edit = [PathHomeSmoke]::FindWindowEx($Window, [IntPtr]::Zero, 'EDIT', $null)
+    $edit = Require-Control $Window 1200
     if ($edit -eq [IntPtr]::Zero) { throw 'State edit control not found.' }
     $result = [UIntPtr]::Zero
     if ([PathHomeSmoke]::SendText($edit, 0xC, [UIntPtr]::Zero, 'MI', 3, 5000, [ref]$result) -eq [IntPtr]::Zero -or $result.ToUInt64() -eq 0) { throw 'Setting synthetic state failed.' }
 }
 function Assert-State([IntPtr]$Window) {
-    $edit = [PathHomeSmoke]::FindWindowEx($Window, [IntPtr]::Zero, 'EDIT', $null)
+    $edit = Require-Control $Window 1200
     if ($edit -eq [IntPtr]::Zero) { throw 'State edit control not found.' }
     $buffer = [Text.StringBuilder]::new(64)
     $result = [UIntPtr]::Zero
@@ -102,7 +102,7 @@ try {
         if (-not $p.WaitForExit(10000)) { throw "Launch $i did not close cleanly." }
         if ($p.ExitCode -ne 0) { throw "Launch $i exited with code $($p.ExitCode)." }
         if (-not (Test-Path -LiteralPath (Join-Path $env:APPDATA 'PathHome\plan.dpapi'))) { throw 'Encrypted synthetic plan was not written.' }
-        Write-Host "PASS launch $i/$Launches: startup, navigation, persistence, GDI and exit"
+        Write-Host "PASS launch $i/${Launches}: startup, navigation, persistence, GDI and exit"
         $p.Dispose()
         $p = $null
     }
