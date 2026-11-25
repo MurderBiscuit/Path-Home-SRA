@@ -157,24 +157,32 @@ public class MainActivity extends Activity {
                 if(derived==null){toast("Could not derive vault key.");return;}
                 if(enrollment){
                     if(vaultEnvelope!=null||vaultLocked||profileLocked){PrivateVault.wipe(derived);return;}
-                    try{
-                        vaultEnvelope=PrivateVault.seal(derived,salt,new byte[0]);vaultKey=derived;
-                        if(!persistProfile()){vaultEnvelope=null;PrivateVault.wipe(vaultKey);vaultKey=null;return;}
-                        savePending=false;getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
-                        show("privacy");toast("Private Vault enabled. Store your passphrase safely; it cannot be reset.");
-                    }catch(Exception e){vaultEnvelope=null;PrivateVault.wipe(derived);vaultKey=null;toast("Could not enable Private Vault. Existing plan preserved.");}
+                    byte[] marker;
+                    try{marker=PrivateVault.seal(derived,salt,new byte[0]);}
+                    catch(Exception e){PrivateVault.wipe(derived);toast("Could not enable Private Vault. Existing plan preserved.");return;}
+                    vaultEnvelope=marker;vaultKey=derived;
+                    if(!persistProfile()){
+                        // SharedPreferences may have updated its in-memory cache despite commit failure.
+                        // Stop rather than downgrade a possibly protected record on another write.
+                        PrivateVault.wipe(vaultKey);vaultKey=null;profileLocked=true;profile=new JSONObject();savePending=false;
+                        toast("Vault enrollment could not be confirmed. Close and reopen Path Home. Do not erase the saved plan.");
+                        finish();return;
+                    }
+                    savePending=false;getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+                    show("privacy");toast("Private Vault enabled. Store your passphrase safely; it cannot be reset.");
                     return;
                 }
-                byte[] raw=null;
+                byte[] raw=null;JSONObject next;
                 try{
                     raw=PrivateVault.open(derived,vaultEnvelope);
-                    JSONObject next=new JSONObject(new String(raw,StandardCharsets.UTF_8));
-                    profile=next;vaultKey=derived;vaultLocked=false;vaultFailures=0;vaultNextAttempt=0;vaultNotice="";show("home");
+                    next=new JSONObject(new String(raw,StandardCharsets.UTF_8));
                 }catch(Exception e){
                     PrivateVault.wipe(derived);
                     vaultFailures++;vaultNextAttempt=android.os.SystemClock.elapsedRealtime()+Math.min(vaultFailures,15)*1000L;
-                    toast("Incorrect passphrase or damaged vault. Saved data unchanged.");
+                    toast("Incorrect passphrase or damaged vault. Saved data unchanged.");return;
                 }finally{PrivateVault.wipe(raw);}
+                profile=next;vaultKey=derived;vaultLocked=false;vaultFailures=0;vaultNextAttempt=0;vaultNotice="";
+                show("home");
             });
         },"path-home-vault-kdf").start();
     }
@@ -270,6 +278,7 @@ public class MainActivity extends Activity {
         toolbar=row();toolbar.setBackgroundColor(NAVY);padding(toolbar,18,16,15,15);
         ImageView brandMark=new ImageView(this);brandMark.setImageResource(R.drawable.pathhome_brand);brandMark.setScaleType(ImageView.ScaleType.FIT_CENTER);toolbar.addView(brandMark,new LinearLayout.LayoutParams(dp(46),dp(46)));
         TextView app=text("PATH HOME",19,WHITE,true);padding(app,10,0,0,0);toolbar.addView(app,new LinearLayout.LayoutParams(0,dp(48),1));
+        TextView privacyMenu=text("🔒",23,WHITE,true);privacyMenu.setContentDescription("Privacy and Private Vault");privacyMenu.setGravity(Gravity.CENTER);privacyMenu.setOnClickListener(v->show("privacy"));toolbar.addView(privacyMenu,new LinearLayout.LayoutParams(dp(46),dp(48)));
         TextView menu=text("⌂",28,WHITE,true);menu.setContentDescription("Go to Path Home start screen");menu.setGravity(Gravity.CENTER);menu.setOnClickListener(v->show("home"));toolbar.addView(menu,new LinearLayout.LayoutParams(dp(48),dp(48)));add(root,toolbar);
         scroll=new ScrollView(this);scroll.setFillViewport(false);content=column();padding(content,17,19,17,25);scroll.addView(content);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
         switch(next){case "home":home();break;case "plan":plan();break;case "timeline":timeline();break;case "allowed":allowed();break;case "allowed_results":results();break;case "money":money();break;case "help":help();break;case "appointments":appointments();break;case "family":family();break;case "progress":progress();break;case "unstuck":unstuck();break;case "privacy":privacy();break;case "stay":stayOnTrack();break;case "law":lawLibrary();break;case "mission":mission();break;default:home();}
@@ -665,13 +674,14 @@ public class MainActivity extends Activity {
         else if(lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER))provider=LocationManager.NETWORK_PROVIDER;
         if(provider==null){toast("Turn on location services to check this place.");return;}
         checkInProgress=true;
+        final int requestGeneration=vaultGeneration;
         try{
             if(Build.VERSION.SDK_INT>=30){
-                lm.getCurrentLocation(provider,new CancellationSignal(),getMainExecutor(),loc->{checkInProgress=false;onLocalLocation(loc);});
+                lm.getCurrentLocation(provider,new CancellationSignal(),getMainExecutor(),loc->{if(requestGeneration!=vaultGeneration)return;checkInProgress=false;onLocalLocation(loc);});
             }else{
                 lm.requestSingleUpdate(provider,new LocationListener(){
-                    @Override public void onLocationChanged(Location loc){checkInProgress=false;onLocalLocation(loc);}
-                    @Override public void onProviderDisabled(String p){checkInProgress=false;toast("Location provider is off.");}
+                    @Override public void onLocationChanged(Location loc){if(requestGeneration!=vaultGeneration)return;checkInProgress=false;onLocalLocation(loc);}
+                    @Override public void onProviderDisabled(String p){if(requestGeneration!=vaultGeneration)return;checkInProgress=false;toast("Location provider is off.");}
                 },null);
             }
         }catch(Exception ex){checkInProgress=false;toast("Could not check location. Please try again.");}
