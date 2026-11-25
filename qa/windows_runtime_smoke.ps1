@@ -249,6 +249,64 @@ try {
         $p.Dispose()
         $p = $null
     }
+    # Opt-in vault tests use only the same synthetic fixture and a disposable test phrase.
+    function Start-VaultTestWindow {
+        $script:p = Start-Process -FilePath $Exe -PassThru
+        $limit = [DateTime]::UtcNow.AddSeconds(30)
+        do {
+            $script:p.Refresh()
+            if ($script:p.HasExited) { throw "Vault instance exited: $($script:p.ExitCode)" }
+            $h = $script:p.MainWindowHandle
+            if ($h -ne [IntPtr]::Zero -and ([PathHomeSmoke]::GetDlgItem($h,200) -ne [IntPtr]::Zero -or [PathHomeSmoke]::GetDlgItem($h,1301) -ne [IntPtr]::Zero)) { Send-Bounded $h 0; return $h }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $limit)
+        throw 'Vault window did not open.'
+    }
+    $window=Start-VaultTestWindow
+    $phrase='synthetic private vault test phrase'
+    Navigate $window 904 1306
+    Set-Field $window 1304 $phrase
+    Set-Field $window 1305 'different synthetic phrase'
+    Dialog-Action $window $p.Id 1306 'matching passphrase'
+    [void](Require-Control $window 1306)
+    Set-Field $window 1304 $phrase
+    Set-Field $window 1305 $phrase
+    Dialog-Action $window $p.Id 1306 'Private Vault enabled'
+    [void](Require-Control $window 1303)
+    $plan=Join-Path $env:APPDATA 'PathHome\plan.dpapi'
+    Add-Type -AssemblyName System.Security
+    $inner=[Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($plan),$null,[Security.Cryptography.DataProtectionScope]::CurrentUser)
+    if ([Text.Encoding]::ASCII.GetString($inner,0,4) -ne 'PHV1') {throw 'Account decryption did not reveal a second authenticated envelope.'}
+    if ([Text.Encoding]::UTF8.GetString($inner).Contains('"state"')) {throw 'Plaintext plan exposed after DPAPI unwrap.'}
+    Navigate $window 1303 1301
+    if ([PathHomeSmoke]::GetDlgItem($window,200) -ne [IntPtr]::Zero) {throw 'Home remains accessible while vault is locked.'}
+    $lockedHash=(Get-FileHash -LiteralPath $plan -Algorithm SHA256).Hash
+    Set-Field $window 1300 'incorrect synthetic passphrase'
+    Dialog-Action $window $p.Id 1301 'Passphrase incorrect'
+    if ((Get-FileHash -LiteralPath $plan -Algorithm SHA256).Hash -ne $lockedHash) {throw 'Failed unlock modified profile.'}
+    Start-Sleep -Milliseconds 1100
+    Set-Field $window 1300 $phrase
+    Navigate $window 1301 200
+    Navigate $window 101 350
+    Assert-State $window
+    # Simulate a session lock message. Actual OS lock and idle duration require device qualification.
+    Send-Bounded $window 0x2B1 7
+    [void](Require-Control $window 1301)
+    $lockedHash=(Get-FileHash -LiteralPath $plan -Algorithm SHA256).Hash
+    Send-Bounded $window 0x10
+    if (-not $p.WaitForExit(10000) -or $p.ExitCode -ne 0) {throw 'Locked app failed to close.'}
+    $p.Dispose();$p=$null
+    if ((Get-FileHash -LiteralPath $plan -Algorithm SHA256).Hash -ne $lockedHash) {throw 'Closing locked vault modified profile.'}
+    $window=Start-VaultTestWindow
+    [void](Require-Control $window 1301)
+    Set-Field $window 1300 $phrase
+    Navigate $window 1301 200
+    Navigate $window 101 350
+    Assert-State $window
+    Send-Bounded $window 0x10
+    if (-not $p.WaitForExit(10000) -or $p.ExitCode -ne 0) {throw 'Unlocked app failed to close.'}
+    $p.Dispose();$p=$null
+    Write-Host 'PASS Private Vault: enrollment, independent envelope, wrong passphrase, locking, restart, encrypted persistence and simulated session lock'
 } finally {
     if ($null -ne $p) {
         if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
