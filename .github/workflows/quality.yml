@@ -38,6 +38,38 @@ jobs:
           assert p[:2]==b'MZ' and p[struct.unpack_from('<I',p,0x3c)[0]:][:4]==b'PE\0\0' and b'.rsrc\0' in p[:8192]
           print('Windows PE validated')
           PYTEST
+  windows-runtime:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: desktop/windows/go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Native Windows unit tests and vet
+        working-directory: desktop/windows
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Build Windows x64 QA executable
+        working-directory: desktop/windows
+        run: go build -trimpath -ldflags="-H windowsgui" -o PathHome_Windows_x64.exe .
+      - name: Embed approved icon
+        run: python tools/embed_windows_icon.py --exe desktop/windows/PathHome_Windows_x64.exe --ico branding/PathHome.ico
+      - name: Native launch, navigation, persistence and GDI gate
+        shell: powershell
+        run: ./qa/windows_runtime_smoke.ps1 -Exe ./desktop/windows/PathHome_Windows_x64.exe -Launches 10
+      - name: Preserve tested unsigned QA executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: path-home-windows-runtime-tested-qa
+          path: desktop/windows/PathHome_Windows_x64.exe
+          if-no-files-found: error
+          retention-days: 14
   android:
     runs-on: ubuntu-latest
     steps:
