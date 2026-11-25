@@ -24,6 +24,22 @@ public static class PathHomeSmoke {
     public delegate bool EnumProc(IntPtr h, IntPtr p);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L,T,R,B; }
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr h, EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr p);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h,StringBuilder b,int n);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsWindowEnabled(IntPtr h);
+    [DllImport("user32.dll",EntryPoint="PostMessageW")] public static extern bool Post(IntPtr h,uint m,UIntPtr w,IntPtr l);
+    public static IntPtr[] Dialogs(uint pid) {
+        var list=new System.Collections.Generic.List<IntPtr>();
+        EnumWindows(delegate(IntPtr h,IntPtr p) {
+            uint owner; GetWindowThreadProcessId(h,out owner);
+            var cls=new StringBuilder(256); GetClassName(h,cls,256);
+            if(owner==pid && IsWindowVisible(h) && cls.ToString()=="#32770") list.Add(h);
+            return true;
+        },IntPtr.Zero);
+        return list.ToArray();
+    }
     [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
@@ -81,6 +97,32 @@ function Assert-Screen([IntPtr]$Window,[string]$Expected) {
     $screen = ([PathHomeSmoke]::Children($Window) | ForEach-Object { Read-Control $_ }) -join ' '
     if (-not $screen.Contains($Expected)) { throw "Expected screen text missing: $Expected" }
 }
+function Dialog-Action([IntPtr]$Window,[uint32]$ProcessId,[int]$Button,[string]$Expected) {
+    if (@([PathHomeSmoke]::Dialogs($ProcessId)).Count -ne 0) { throw 'Stale modal before action.' }
+    $h = Require-Control $Window $Button
+    if (-not [PathHomeSmoke]::Post($Window,0x111,[UIntPtr]::new([uint32]$Button),$h)) { throw 'Cannot post dialog action.' }
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    $dialog = [IntPtr]::Zero
+    do {
+        $ds = @([PathHomeSmoke]::Dialogs($ProcessId))
+        if ($ds.Count -eq 1 -and [PathHomeSmoke]::GetDlgItem($ds[0],1) -ne [IntPtr]::Zero) { $dialog = $ds[0]; break }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    if ($dialog -eq [IntPtr]::Zero) { throw "Expected dialog not shown: $Expected" }
+    $actual = ([PathHomeSmoke]::Children($dialog) | ForEach-Object { Read-Control $_ }) -join ' '
+    $ok = Require-Control $dialog 1
+    if (-not [PathHomeSmoke]::Post($dialog,0x111,[UIntPtr]::new([uint32]1),$ok)) { throw 'Cannot dismiss modal.' }
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    do {
+        if (-not [PathHomeSmoke]::IsWindow($dialog) -and @([PathHomeSmoke]::Dialogs($ProcessId)).Count -eq 0 -and [PathHomeSmoke]::IsWindowEnabled($Window)) {
+            Send-Bounded $Window 0
+            if ($actual.IndexOf($Expected,[StringComparison]::OrdinalIgnoreCase) -lt 0) { throw "Unexpected dialog. Expected: $Expected; actual: $actual" }
+            return
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'Dialog did not close.'
+}
 function Navigate([IntPtr]$Window, [int]$Button, [int]$Expected) {
     $control = Require-Control $Window $Button
     # Send the exact BN_CLICKED notification used by a native button.
@@ -130,6 +172,30 @@ try {
         Navigate $window 100 200
         Navigate $window 101 350
         Assert-State $window
+        if ($i -eq 1) {
+            $plan = Join-Path $env:APPDATA 'PathHome\plan.dpapi'
+            $oldHash = (Get-FileHash -LiteralPath $plan -Algorithm SHA256).Hash
+            Set-Field $window 1200 'ZZ'
+            Dialog-Action $window $p.Id 100 'valid two-letter state abbreviation'
+            Set-Field $window 1200 'MI'
+            Set-Field $window 1205 '2026-02-30'
+            Dialog-Action $window $p.Id 100 'Enter dates as YYYY-MM-DD'
+            if ((Get-FileHash -LiteralPath $plan -Algorithm SHA256).Hash -ne $oldHash) { throw 'Invalid release data replaced encrypted plan.' }
+            Set-Field $window 1205 ''
+            Navigate $window 104 375
+            Set-Field $window 1208 '2030-02-31'
+            Dialog-Action $window $p.Id 376 'Enter dates as YYYY-MM-DD'
+            Dialog-Action $window $p.Id 375 'Enter dates as YYYY-MM-DD'
+            Set-Field $window 1208 '2030-01-15'
+            Navigate $window 376 375
+            Navigate $window 110 431
+            Dialog-Action $window $p.Id 432 'Turn on private reminders first'
+            Navigate $window 431 431
+            Assert-Screen $window 'Optional reminder: ON'
+            Dialog-Action $window $p.Id 432 'Are you in the right place'
+            Navigate $window 431 431
+            Assert-Screen $window 'Optional reminder: OFF'
+        }
         # Confirm optional amounts remain unknown instead of silently becoming zero.
         Navigate $window 105 380
         if ($i -eq 1) {
