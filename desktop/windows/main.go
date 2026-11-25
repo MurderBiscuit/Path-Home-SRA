@@ -444,6 +444,13 @@ func loadPrivatePlan() error {
 		if err != nil {
 			return fmt.Errorf("encrypted profile could not be opened: %w", err)
 		}
+		defer clear(raw)
+		if isVault(raw) {
+			if _, err := vaultSalt(raw); err != nil { return err }
+			vaultEnvelope = bytes.Clone(raw)
+			vaultLocked = true
+			return nil
+		}
 		return json.Unmarshal(raw, &input)
 	} else if !os.IsNotExist(err) {
 		return err
@@ -474,18 +481,29 @@ func saveEncrypted(raw []byte) error {
 	if path == "" {
 		return fmt.Errorf("secure user directory unavailable")
 	}
-	encrypted, err := protectLocal(raw)
-	if err != nil {
-		return err
+	if vaultLocked { return fmt.Errorf("private vault is locked") }
+	payload := raw
+	if len(vaultEnvelope)>0 {
+		salt,err:=vaultSalt(vaultEnvelope)
+		if err!=nil{return err}
+		payload,err=sealVault(vaultKey,salt,raw)
+		if err!=nil{return err}
 	}
-	return atomicPrivateWrite(path, encrypted)
+	encrypted, err := protectLocal(payload)
+	if err != nil { return err }
+	if err=atomicPrivateWrite(path, encrypted);err!=nil{return err}
+	if len(vaultEnvelope)>0 {vaultEnvelope=payload}
+	return nil
 }
-func save(silent bool) bool {
+func save(silent bool) bool { return saveWithFeedback(silent,true) }
+func saveWithFeedback(silent,showErrors bool) bool {
+	if vaultLocked {return false}
+	fail:=func(msg string){if showErrors{alert(msg)}}
 	// Validate the live entry fields before syncFields can coerce bad numeric text to zero.
 	for _, k := range []string{"cash", "birthCost", "idCost", "otherCost"} {
 		if c, ok := fields[k]; ok {
 			if err := validateMoneyField(getText(c)); err != nil {
-				alert("Check the amount for " + k + ": " + err.Error() + ". Leave blank if unknown.")
+				fail("Check the amount for " + k + ": " + err.Error() + ". Leave blank if unknown.")
 				return false
 			}
 		}
@@ -500,28 +518,29 @@ func save(silent bool) bool {
 	defer func() { if !committed { input = previous } }()
 	syncFields()
 	if !knownJurisdiction(input.State, data.Jurisdictions) {
-		alert("Use a valid two-letter state abbreviation for where you live (for example MI), or leave blank. Enter federal supervised release in the supervision field.")
+		fail("Use a valid two-letter state abbreviation for where you live (for example MI), or leave blank. Enter federal supervised release in the supervision field.")
 		return false
 	}
 	if invalidDate(input.Release) || invalidDate(input.Start) || invalidDate(input.End) || invalidDate(input.AppointmentDate) {
-		alert("Enter dates as YYYY-MM-DD, or leave them blank if unknown.")
+		fail("Enter dates as YYYY-MM-DD, or leave them blank if unknown.")
 		return false
 	}
 	if !dateOrderValid(input.Start, input.End) {
-		alert("The expected supervision end date cannot be before the supervision start date. Confirm both dates.")
+		fail("The expected supervision end date cannot be before the supervision start date. Confirm both dates.")
 		return false
 	}
 	b, err := json.MarshalIndent(input, "", "  ")
 	if err == nil {
 		err = saveEncrypted(b)
 	}
+	clear(b)
 	if err != nil {
-		alert("Could not securely save your plan: " + err.Error())
+		fail("Could not securely save your plan: " + err.Error())
 		return false
 	}
 	committed = true
-	if !silent {
-		alert("Saved securely for this Windows account. This is not a synced account.")
+	if !silent && showErrors {
+		alert("Saved securely on this device. This is not a synced account.")
 	}
 	return true
 }
@@ -653,11 +672,13 @@ func addNav(x, y int) {
 	}
 }
 func draw() {
+	if vaultLocked {drawVaultUnlock();return}
 	clearPanel()
 	navGlyph("brand", 35, 13, 72)
 	title(115, 19, 750, "PATH HOME · STRUCTURAL REENTRY ASSISTANCE")
 	text(115, 64, 750, 30, "Your next step, made clear.    |    Not a government service · Private local tools", false)
 	addNav(22, 128)
+	btn(62, 690, 196, 42, "Privacy & lock", 904, func() { nav("privacy") })
 	btn(883, 22, 194, 45, "Our Mission", 900, func() { nav("mission") })
 	btn(883, 74, 194, 34, "Appearance", 903, func() { nav("appearance") })
 	x := 284
@@ -669,6 +690,8 @@ func draw() {
 		drawMission(x, w)
 	case "appearance":
 		drawAppearance(x, w)
+	case "privacy":
+		drawPrivacy(x,w)
 	case "plan":
 		drawPlan(x, w)
 	case "ask":
@@ -1115,8 +1138,14 @@ func wndproc(h uintptr, msg uint32, w, l uintptr) uintptr {
 			proc(pCopyMemory, l, uintptr(unsafe.Pointer(&mm[0])), unsafe.Sizeof(mm))
 			return 0
 		}
+	case 0x0113: // WM_TIMER
+		if !vaultLocked && len(vaultKey)>0 && (vaultPendingLock || time.Since(vaultLastActivity)>=vaultIdle) {lockPrivateVault(true)}
+		return 0
+	case 0x02B1: // WM_WTSSESSION_CHANGE
+		if w==7 && len(vaultKey)>0 {vaultPendingLock=true;lockPrivateVault(true)}
+		return 0
 	case WM_CLOSE:
-		if !save(true) {
+		if !vaultLocked && !save(true) {
 			return 0
 		}
 		proc(pDestroyWindow, h)
@@ -1180,6 +1209,10 @@ func run() (exitCode int) {
 		alert("Path Home reference data could not be loaded. Please use a verified application build.")
 		return 1
 	}
+	lease,err:=acquireProfileLease()
+	if err!=nil {alert("Path Home cannot acquire its private profile. Close any other instance and try again. No data was changed.");return 1}
+	defer syscall.CloseHandle(lease)
+	defer func(){clear(vaultKey)}()
 	log.Print("startup: opening local profile")
 	if err := loadPrivatePlan(); err != nil {
 		log.Print("startup: secure profile could not be opened")
@@ -1229,6 +1262,10 @@ func run() (exitCode int) {
 			if obj != 0 { proc(pDeleteObject, obj) }
 		}
 	}()
+	vaultLastActivity=time.Now()
+	if proc(user32.NewProc("SetTimer"),h,1,1000,0)==0 {log.Print("vault idle timer unavailable")}
+	defer proc(user32.NewProc("KillTimer"),h,1)
+	if proc(wtsRegister,h,0)!=0 {defer proc(wtsUnregister,h)} else {log.Print("session lock notification unavailable")}
 	log.Print("startup: rendering home")
 	draw()
 	proc(pShowWindow, h, 5)
@@ -1242,6 +1279,7 @@ func run() (exitCode int) {
 			return 1
 		}
 		if int32(v) == 0 { return 0 }
+		if (m.Message>=0x0100 && m.Message<=0x0109)||(m.Message>=0x0200 && m.Message<=0x020E){vaultLastActivity=time.Now()}
 		proc(pTranslateMessage, uintptr(unsafe.Pointer(&m)))
 		proc(pDispatchMessage, uintptr(unsafe.Pointer(&m)))
 	}
