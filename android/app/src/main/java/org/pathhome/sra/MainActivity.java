@@ -48,13 +48,30 @@ public class MainActivity extends Activity {
     private EditText countyInput;
     private JSONObject profile = new JSONObject(), legal = new JSONObject();
     private boolean profileLocked = false;
+    private boolean vaultLocked=false, vaultBusy=false, foreground=false;
+    private byte[] vaultKey, vaultEnvelope;
+    private int vaultGeneration=0, vaultFailures=0;
+    private long vaultNextAttempt=0;
+    private String vaultNotice="";
     // Avoid encrypting and blocking disk writes on every character typed.
     private final android.os.Handler saveHandler = new android.os.Handler(android.os.Looper.getMainLooper());
     private boolean savePending = false;
     private final Runnable deferredSave = () -> {savePending=false;saveProfile();};
-    private void queueSave(){if(profileLocked)return;savePending=true;saveHandler.removeCallbacks(deferredSave);saveHandler.postDelayed(deferredSave,350L);}
+    private void queueSave(){if(profileLocked||vaultLocked)return;savePending=true;saveHandler.removeCallbacks(deferredSave);saveHandler.postDelayed(deferredSave,350L);}
     private void flushSave(){if(savePending){saveHandler.removeCallbacks(deferredSave);savePending=false;saveProfile();}}
     @Override protected void onPause(){flushSave();super.onPause();}
+    @Override protected void onStart(){super.onStart();foreground=true;}
+    @Override protected void onStop(){
+        foreground=false;vaultGeneration++;vaultBusy=false;
+        if(vaultKey!=null&&!vaultLocked){
+            lockVault(false);
+            // End the protected activity on backgrounding to destroy stale dialogs and views.
+            // Rotation creates a fresh locked activity; other returns require reopening Path Home.
+            if(!isChangingConfigurations()&&!isFinishing())finish();
+        }
+        super.onStop();
+    }
+    @Override protected void onDestroy(){vaultGeneration++;PrivateVault.wipe(vaultKey);vaultKey=null;saveHandler.removeCallbacks(deferredSave);super.onDestroy();}
     private String page = "home";
     private final Map<String,Integer> images = new HashMap<>();
     private final ArrayList<String> jurisdictions = new ArrayList<>();
@@ -74,32 +91,132 @@ public class MainActivity extends Activity {
         images.put("hero",R.drawable.hero);images.put("release_plan",R.drawable.release_plan);images.put("appointments",R.drawable.appointments);images.put("local_help",R.drawable.local_help);images.put("money",R.drawable.money);images.put("family",R.drawable.family);images.put("progress",R.drawable.progress);
         loadData();loadProfile();show(b==null?"home":b.getString("currentPage","home"));
         if(profileLocked){new android.app.AlertDialog.Builder(this).setTitle("Your private plan needs attention")
-            .setMessage("The encrypted plan could not be opened. Your existing data was not replaced. Close the app or explicitly erase the unreadable local plan to start again.")
-            .setCancelable(false).setPositiveButton("Close app",(d,w)->finish())
-            .setNegativeButton("Erase unreadable plan",(d,w)->new android.app.AlertDialog.Builder(this)
-                .setTitle("Permanently erase local plan?")
-                .setMessage("This cannot be undone. Your encrypted file will be deleted from this device.")
-                .setNegativeButton("Cancel",(c,x)->finish())
-                .setPositiveButton("Erase",(c,x)->{getPreferences(MODE_PRIVATE).edit().remove("private_plan").commit();profileLocked=false;profile=new JSONObject();show("home");}).show()).show();}
+            .setMessage("The encrypted plan could not be opened. Your existing data was not replaced. Close the app and preserve the encrypted file.")
+            .setCancelable(false).setPositiveButton("Close app",(d,w)->finish()).show();}
         if(legal.optJSONArray("jurisdictions")==null)toast("Legal reference data is unavailable. Do not rely on results from this copy.");
     }
     @Override protected void onSaveInstanceState(Bundle out){out.putString("currentPage",page);super.onSaveInstanceState(out);}
-    @Override public void onBackPressed(){if(!"home".equals(page))show("home");else super.onBackPressed();}
+    @Override public void onBackPressed(){if(vaultLocked||profileLocked){finish();return;}if(!"home".equals(page))show("home");else super.onBackPressed();}
     private void loadData(){stateCodes.add("");jurisdictions.add("Choose your state — do not guess");try(InputStream f=getAssets().open("reentry-public.json")){
         ByteArrayOutputStream o=new ByteArrayOutputStream();byte[] chunk=new byte[8192];int n;while((n=f.read(chunk))!=-1)o.write(chunk,0,n);
         legal=new JSONObject(o.toString(StandardCharsets.UTF_8.name()));JSONArray a=legal.optJSONArray("jurisdictions");
         if(a!=null)for(int i=0;i<a.length();i++){JSONObject obj=a.optJSONObject(i);if(obj!=null&&!"FED".equals(obj.optString("jurisdiction_code"))){stateCodes.add(obj.optString("jurisdiction_code"));jurisdictions.add(obj.optString("jurisdiction_name"));}}
     }catch(Exception ignored){legal=new JSONObject();}}
-    private void loadProfile(){try{String enc=getPreferences(MODE_PRIVATE).getString("private_plan",null);if(enc!=null)profile=new JSONObject(decrypt(enc));}catch(Exception e){profileLocked=true;profile=new JSONObject();}}
-    private void saveProfile(){if(profileLocked){toast("Encrypted plan is locked. No information was overwritten.");return;}try{String encrypted=encrypt(profile.toString());if(!getPreferences(MODE_PRIVATE).edit().putString("private_plan",encrypted).commit())throw new IOException("Secure storage rejected the write");}catch(Exception e){toast("Could not securely save data. Please check storage.");}}
+    private void loadProfile(){
+        try{
+            String enc=getPreferences(MODE_PRIVATE).getString("private_plan",null);
+            if(enc==null)return;
+            String payload=decrypt(enc);
+            if(payload.startsWith("PHV1:")){
+                byte[] raw=Base64.decode(payload.substring(5),Base64.NO_WRAP);
+                PrivateVault.salt(raw);vaultEnvelope=raw;vaultLocked=true;
+                getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+            }else profile=new JSONObject(payload);
+        }catch(Exception e){profileLocked=true;profile=new JSONObject();}
+    }
+    private boolean persistProfile(){
+        if(profileLocked||vaultLocked){toast("Encrypted plan is locked. No information was overwritten.");return false;}
+        byte[] plain=null;
+        try{
+            String payload;byte[] next=null;
+            if(vaultEnvelope!=null){
+                if(vaultKey==null)throw new IOException("Missing vault key");
+                plain=profile.toString().getBytes(StandardCharsets.UTF_8);
+                next=PrivateVault.seal(vaultKey,PrivateVault.salt(vaultEnvelope),plain);
+                payload="PHV1:"+Base64.encodeToString(next,Base64.NO_WRAP);
+            }else payload=profile.toString();
+            String encrypted=encrypt(payload);
+            if(!getPreferences(MODE_PRIVATE).edit().putString("private_plan",encrypted).commit())throw new IOException("Secure storage rejected the write");
+            if(next!=null)vaultEnvelope=next;
+            return true;
+        }catch(Exception e){toast("Could not securely save data. Please check storage.");return false;}
+        finally{PrivateVault.wipe(plain);}
+    }
+    private void saveProfile(){savePending=!persistProfile();}
+    private EditText vaultPassword(LinearLayout dest,String label){
+        add(dest,text(label,16,INK,true));
+        EditText e=new EditText(this);e.setSingleLine(true);
+        e.setInputType(android.text.InputType.TYPE_CLASS_TEXT|android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD|android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        e.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(256)});
+        e.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
+        e.setSaveEnabled(false);add(dest,e);return e;
+    }
+    private char[] takePassword(EditText e){
+        char[] out=new char[e.length()];e.getText().getChars(0,e.length(),out,0);e.getText().clear();return out;
+    }
+    private void deriveVaultAsync(char[] pass,byte[] salt,boolean enrollment){
+        if(vaultBusy||!foreground){Arrays.fill(pass,'\0');return;}
+        vaultBusy=true;final int generation=++vaultGeneration;
+        new Thread(()->{
+            byte[] key=null;
+            try{key=PrivateVault.derive(pass,salt);}catch(Exception ignored){}finally{Arrays.fill(pass,'\0');}
+            final byte[] derived=key;
+            runOnUiThread(()->{
+                if(generation!=vaultGeneration||!foreground||isFinishing()||isDestroyed()){PrivateVault.wipe(derived);return;}
+                vaultBusy=false;
+                if(derived==null){toast("Could not derive vault key.");return;}
+                if(enrollment){
+                    if(vaultEnvelope!=null||vaultLocked||profileLocked){PrivateVault.wipe(derived);return;}
+                    try{
+                        vaultEnvelope=PrivateVault.seal(derived,salt,new byte[0]);vaultKey=derived;
+                        if(!persistProfile()){vaultEnvelope=null;PrivateVault.wipe(vaultKey);vaultKey=null;return;}
+                        savePending=false;getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);
+                        show("privacy");toast("Private Vault enabled. Store your passphrase safely; it cannot be reset.");
+                    }catch(Exception e){vaultEnvelope=null;PrivateVault.wipe(derived);vaultKey=null;toast("Could not enable Private Vault. Existing plan preserved.");}
+                    return;
+                }
+                byte[] raw=null;
+                try{
+                    raw=PrivateVault.open(derived,vaultEnvelope);
+                    JSONObject next=new JSONObject(new String(raw,StandardCharsets.UTF_8));
+                    profile=next;vaultKey=derived;vaultLocked=false;vaultFailures=0;vaultNextAttempt=0;vaultNotice="";show("home");
+                }catch(Exception e){
+                    PrivateVault.wipe(derived);
+                    vaultFailures++;vaultNextAttempt=android.os.SystemClock.elapsedRealtime()+Math.min(vaultFailures,15)*1000L;
+                    toast("Incorrect passphrase or damaged vault. Saved data unchanged.");
+                }finally{PrivateVault.wipe(raw);}
+            });
+        },"path-home-vault-kdf").start();
+    }
+    private void enableVault(EditText first,EditText second){
+        char[] pass=takePassword(first),confirm=takePassword(second);
+        boolean ok=PrivateVault.valid(pass)&&Arrays.equals(pass,confirm);
+        Arrays.fill(confirm,'\0');
+        if(!ok){Arrays.fill(pass,'\0');toast("Use matching passphrases of at least 15 characters.");return;}
+        deriveVaultAsync(pass,PrivateVault.newSalt(),true);
+    }
+    private void unlockVault(EditText field){
+        char[] pass=takePassword(field);
+        if(android.os.SystemClock.elapsedRealtime()<vaultNextAttempt){Arrays.fill(pass,'\0');toast("Wait before trying again.");return;}
+        try{deriveVaultAsync(pass,PrivateVault.salt(vaultEnvelope),false);}
+        catch(Exception e){Arrays.fill(pass,'\0');toast("Vault damaged. Saved file preserved.");}
+    }
+    private void lockVault(boolean render){
+        if(vaultLocked||vaultKey==null)return;
+        saveHandler.removeCallbacks(deferredSave);savePending=false;
+        if(!persistProfile())vaultNotice="Some unsaved changes could not be saved. The last encrypted plan is preserved.";
+        PrivateVault.wipe(vaultKey);vaultKey=null;profile=new JSONObject();vaultLocked=true;
+        awaitingSaveLocation=false;manualCheck=false;checkInProgress=false;
+        vaultGeneration++;vaultBusy=false;countyInput=null;
+        if(render)showVaultUnlock();
+    }
+    private void showVaultUnlock(){
+        page="locked";countyInput=null;root=column();root.setBackgroundColor(PAPER);padding(root,22,28,22,24);
+        ScrollView lockedScroll=new ScrollView(this);LinearLayout c=column();lockedScroll.addView(c);add(root,lockedScroll);setContentView(root);
+        title(c,"Path Home Private Vault");add(c,paragraph("Your private plan is locked. Enter your independent passphrase. Genyxis cannot reset it."));
+        EditText pass=vaultPassword(c,"Vault passphrase");
+        add(c,button("Unlock private plan",()->unlockVault(pass)));
+        add(c,soft("Close application",()->finish()));
+        if(!vaultNotice.isEmpty())add(c,paragraph(vaultNotice));
+    }
     private SecretKey secret()throws Exception{KeyStore store=KeyStore.getInstance("AndroidKeyStore");store.load(null);if(store.containsAlias("reentry_local_v1"))return((KeyStore.SecretKeyEntry)store.getEntry("reentry_local_v1",null)).getSecretKey();
         KeyGenerator k=KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES,"AndroidKeyStore");k.init(new KeyGenParameterSpec.Builder("reentry_local_v1",KeyProperties.PURPOSE_ENCRYPT|KeyProperties.PURPOSE_DECRYPT).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).setKeySize(256).build());return k.generateKey();}
     private String encrypt(String plaintext)throws Exception{Cipher c=Cipher.getInstance("AES/GCM/NoPadding");c.init(Cipher.ENCRYPT_MODE,secret());byte[] iv=c.getIV(),result=c.doFinal(plaintext.getBytes(StandardCharsets.UTF_8));return Base64.encodeToString(iv,Base64.NO_WRAP)+":"+Base64.encodeToString(result,Base64.NO_WRAP);}
     private String decrypt(String encrypted)throws Exception{String[] chunks=encrypted.split(":",2);Cipher c=Cipher.getInstance("AES/GCM/NoPadding");c.init(Cipher.DECRYPT_MODE,secret(),new GCMParameterSpec(128,Base64.decode(chunks[0],Base64.DEFAULT)));return new String(c.doFinal(Base64.decode(chunks[1],Base64.DEFAULT)),StandardCharsets.UTF_8);}
-    private void put(String k,String v){try{profile.put(k,v);queueSave();}catch(Exception e){toast("Could not update the local plan.");}}
+    private void put(String k,String v){if(vaultLocked||profileLocked)return;try{profile.put(k,v);queueSave();}catch(Exception e){toast("Could not update the local plan.");}}
     private String val(String k){return profile.optString(k,"");}
     private boolean yes(String k){return profile.optBoolean(k,false);}
-    private void putBool(String k, boolean v){try{profile.put(k,v);queueSave();}catch(Exception e){toast("Could not update the local plan.");}}
+    private void putBool(String k, boolean v){if(vaultLocked||profileLocked)return;try{profile.put(k,v);queueSave();}catch(Exception e){toast("Could not update the local plan.");}}
 
     private GradientDrawable bg(int color,int radius){GradientDrawable d=new GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));return d;}
     private GradientDrawable stroke(int color,int edge){GradientDrawable d=bg(color,17);d.setStroke(dp(1),edge);return d;}
@@ -149,7 +266,7 @@ public class MainActivity extends Activity {
     private void title(LinearLayout dest,String t){add(dest,text(t,25,NAVY,true));dest.addView(spacer(7));}
     private void small(LinearLayout dest,String t){add(dest,text(t,13,MUTED,false));}
     private ImageView photo(String image,int h){ImageView p=new ImageView(this);p.setImageResource(images.get(image));p.setScaleType(ImageView.ScaleType.CENTER_CROP);p.setBackground(bg(0xffd7e7df,14));p.setClipToOutline(true);p.setLayoutParams(new LinearLayout.LayoutParams(-1,dp(h)));return p;}
-    private void show(String next){flushSave();countyInput=null;page=next;root=column();root.setBackgroundColor(PAPER);setContentView(root);
+    private void show(String next){if(vaultLocked){showVaultUnlock();return;}flushSave();countyInput=null;page=next;root=column();root.setBackgroundColor(PAPER);setContentView(root);
         toolbar=row();toolbar.setBackgroundColor(NAVY);padding(toolbar,18,16,15,15);
         ImageView brandMark=new ImageView(this);brandMark.setImageResource(R.drawable.pathhome_brand);brandMark.setScaleType(ImageView.ScaleType.FIT_CENTER);toolbar.addView(brandMark,new LinearLayout.LayoutParams(dp(46),dp(46)));
         TextView app=text("PATH HOME",19,WHITE,true);padding(app,10,0,0,0);toolbar.addView(app,new LinearLayout.LayoutParams(0,dp(48),1));
@@ -209,6 +326,7 @@ public class MainActivity extends Activity {
         tile("progress","My progress","Track the first things you've already completed.","progress");
         small(content,"Not a government service. Legal summaries are general information and may need review.");
         LinearLayout missionCard=card(content);title(missionCard,"Our Mission");add(missionCard,paragraph("Because freedom deserves a fighting chance."));add(missionCard,soft("Read the full mission statement  ›",()->show("mission")));
+        add(content,soft("Privacy & Private Vault",()->show("privacy")));
         small(content,"Published by Genyxis Network");
     }
     private EditText input(LinearLayout c,String label,String key,String hint){add(c,text(label,16,INK,true));EditText e=new EditText(this);if("county".equals(key))countyInput=e;e.setSingleLine(true);e.setTextSize(18);e.setHint(hint);e.setText(val(key));e.setBackground(stroke(0xfffafcfb,0xffc8d6d4));padding(e,14,11,12,11);LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,dp(50));p.setMargins(0,dp(7),0,dp(16));c.addView(e,p);e.addTextChangedListener(new android.text.TextWatcher(){public void beforeTextChanged(CharSequence s,int st,int count,int after){}public void onTextChanged(CharSequence s,int st,int before,int count){put(key,s.toString());}public void afterTextChanged(android.text.Editable a){}});return e;}
@@ -537,7 +655,7 @@ public class MainActivity extends Activity {
     }
     @SuppressWarnings("MissingPermission")
     private void fetchLocalLocation(){
-        if(!hasForegroundLocation() || checkInProgress)return;
+        if(vaultLocked||profileLocked||!foreground||!hasForegroundLocation() || checkInProgress)return;
         final LocationManager lm=(LocationManager)getSystemService(Context.LOCATION_SERVICE);
         if(lm==null){toast("Location is unavailable on this phone.");return;}
         String provider=null;
@@ -559,6 +677,7 @@ public class MainActivity extends Activity {
         }catch(Exception ex){checkInProgress=false;toast("Could not check location. Please try again.");}
     }
     private void onLocalLocation(Location here){
+        if(vaultLocked||profileLocked||!foreground)return;
         if(here==null){awaitingSaveLocation=false;manualCheck=false;toast("Could not get a current location. Try outdoors or near a window.");return;}
         if(!yes("stay_enabled")){manualCheck=false;awaitingSaveLocation=false;toast("Private check-ins are turned off.");return;}
         if(awaitingSaveLocation){
@@ -602,6 +721,7 @@ public class MainActivity extends Activity {
     }
     @Override protected void onResume(){
         super.onResume();
+        if(vaultLocked||profileLocked)return;
         if(!awaitingSaveLocation && yes("stay_enabled") && profile.optJSONArray("stay_zones")!=null &&
            profile.optJSONArray("stay_zones").length()>0 && hasForegroundLocation()){
             awaitingSaveLocation=false;manualCheck=false;fetchLocalLocation();
@@ -620,6 +740,28 @@ public class MainActivity extends Activity {
         add(content,paragraph("Published by Genyxis Network"));
         add(content,soft("Back to Home  ›",()->show("home")));
     }
-    private void privacy(){title(content,"Privacy and account safety");add(content,paragraph("Publisher: Genyxis Network"));add(content,soft("Read Our Mission",()->show("mission")));add(content,paragraph("Your plan is encrypted on this phone with Android Keystore. It is not synced. Don't enter Social Security numbers, case passwords, or sensitive documents."));LinearLayout c=card(content);add(c,button("Delete all local plan data",()->new android.app.AlertDialog.Builder(this).setTitle("Delete saved plan?").setMessage("This erases local dates, notes, progress and budgeting on this device.").setNegativeButton("Cancel",null).setPositiveButton("Delete",(d,w)->{savePending=false;saveHandler.removeCallbacks(deferredSave);getPreferences(MODE_PRIVATE).edit().clear().commit();profile=new JSONObject();profileLocked=false;show("home");}).show()));}
+    private void privacy(){
+        title(content,"Privacy and account safety");
+        add(content,paragraph("Publisher: Genyxis Network. Your plan is encrypted on this phone and is not synced."));
+        LinearLayout c=card(content);
+        if(vaultEnvelope!=null){
+            title(c,"Private Vault enabled");add(c,paragraph("Your independent passphrase protects the plan in addition to Android Keystore. The protected activity closes when it moves to the background."));
+            add(c,button("Lock my private plan",()->lockVault(true)));
+        }else{
+            title(c,"Enable Private Vault");add(c,paragraph("Use a separate passphrase of 15 or more characters. If forgotten, your plan cannot be recovered. Keep it safely offline. Older backups may have only device-level protection."));
+            EditText p=vaultPassword(c,"New passphrase"),q=vaultPassword(c,"Confirm passphrase");
+            add(c,button("Enable Private Vault",()->enableVault(p,q)));
+        }
+        add(content,paragraph("Do not enter Social Security numbers, case passwords, or sensitive documents. Malware controlling an unlocked phone can still see what you type and read."));
+        add(content,soft("Read Our Mission",()->show("mission")));
+        add(content,soft("Delete all local plan data",()->new android.app.AlertDialog.Builder(this).setTitle("Delete saved plan?")
+            .setMessage("This permanently erases your local plan. This is not a passphrase recovery option.")
+            .setNegativeButton("Cancel",null).setPositiveButton("Delete",(d,w)->{
+                if(vaultLocked||profileLocked||vaultBusy)return;
+                if(!getPreferences(MODE_PRIVATE).edit().remove("private_plan").commit()){toast("Deletion failed; existing data preserved.");return;}
+                savePending=false;saveHandler.removeCallbacks(deferredSave);PrivateVault.wipe(vaultKey);vaultKey=null;vaultEnvelope=null;profile=new JSONObject();
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE);show("home");
+            }).show()));
+    }
     private void toast(String s){Toast.makeText(this,s,Toast.LENGTH_LONG).show();}
 }
